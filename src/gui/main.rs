@@ -360,6 +360,32 @@ impl App {
 
     // ---- per-frame upkeep ----------------------------------------------
 
+    /// (dot color, header text) for the current state.
+    fn status_line(&self) -> (egui::Color32, String) {
+        let green = egui::Color32::from_rgb(0x3C, 0xB0, 0x57);
+        let amber = egui::Color32::from_rgb(0xE8, 0xB0, 0x30);
+        let gray = egui::Color32::from_rgb(0x90, 0x90, 0x90);
+        match (&self.status, self.engine.as_ref()) {
+            (Status::Listening { addr }, Some(e)) => (
+                green,
+                if e.sessions > 0 {
+                    format!(
+                        "Connected · {} · {} active session{}",
+                        addr,
+                        e.sessions,
+                        if e.sessions == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!("Connected · {addr} (waiting for the first connection)")
+                },
+            ),
+            (Status::Listening { .. }, None) => (green, "Connected".to_owned()),
+            (Status::Stopping, _) => (amber, "Disconnecting…".to_owned()),
+            (Status::Disconnected, Some(_)) => (amber, "Connecting…".to_owned()),
+            (Status::Disconnected, None) => (gray, "Disconnected".to_owned()),
+        }
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         // Forwarder events.
         if let Some(handle) = self.engine.as_mut() {
@@ -452,19 +478,12 @@ impl eframe::App for App {
                     egui::RichText::new("cfssh-proxy").strong().size(18.0),
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (dot, text) = match (&self.status, self.engine.is_some()) {
-                        (Status::Listening { addr }, _) => {
-                            ("●".to_owned(), format!("connected · port {}", addr.port()))
-                        }
-                        (Status::Stopping, _) => ("◐".to_owned(), "stopping…".to_owned()),
-                        (Status::Disconnected, true) => ("◐".to_owned(), "connecting…".to_owned()),
-                        (Status::Disconnected, false) => {
-                            ("○".to_owned(), "disconnected".to_owned())
-                        }
-                    };
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(format!("{dot} {text}")).weak(),
-                    ));
+                    let (color, text) = self.status_line();
+                    // Painted dot: independent of which glyphs the font has.
+                    let (rect, _) =
+                        ui.allocate_at_least(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.5, color);
+                    ui.label(text);
                 });
             });
         });
@@ -605,18 +624,36 @@ impl App {
             });
 
         ui.add_space(12.0);
+
+        // Status banner: the state, in words and color, right where the eye
+        // lands before the form.
+        let (color, text) = self.status_line();
+        ui.add(egui::Label::new(
+            egui::RichText::new(text).strong().size(15.0).color(color),
+        ));
+        ui.add_space(6.0);
+
         ui.horizontal(|ui| {
-            let busy = self.engine.is_some();
-            if busy {
-                if ui.button("■ Disconnect").clicked() {
-                    self.disconnect();
-                }
-            } else if ui
-                .add(egui::Button::new("▶ Connect").min_size([120.0, 28.0].into()))
+            let connected = self.engine.is_some();
+            if ui
+                .add_enabled(
+                    !connected,
+                    egui::Button::new("▶ Connect").min_size(egui::vec2(120.0, 28.0)),
+                )
                 .clicked()
             {
                 self.connect();
             }
+            if ui
+                .add_enabled(
+                    connected,
+                    egui::Button::new("■ Disconnect").min_size(egui::vec2(120.0, 28.0)),
+                )
+                .clicked()
+            {
+                self.disconnect();
+            }
+            ui.separator();
             let trusting = self.trust.as_ref().is_some_and(|t| t.running);
             if ui
                 .add_enabled(!trusting, egui::Button::new("⟳ Learn host key"))
