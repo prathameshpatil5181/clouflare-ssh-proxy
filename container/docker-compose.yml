@@ -1,0 +1,27 @@
+# Dev container for JetBrains remote development, published for the tunnel.
+#   docker compose up -d
+# The tunnel route on the SERVER is ssh.ppcoder.xyz -> tcp://localhost:2222.
+
+services:
+  dev:
+    build: .
+    image: cfssh-dev
+    container_name: cfssh-dev
+    ports:
+      # Publish sshd on the HOST loopback ONLY; cloudflared runs on the host
+      # and forwards the tunnel to localhost:2222.
+      - "127.0.0.1:2222:22"
+    volumes:
+      # Stable sshd host keys (do not re-generate per restart).
+      - ssh-host-keys:/etc/ssh
+      # Home directory and JetBrains backend so the IDE isn't re-downloaded.
+      - dev-home:/home/dev
+      - jetbrains-cache:/home/dev/.cache
+    restart: unless-stopped
+    tmpfs:
+      - /tmp
+
+volumes:
+  ssh-host-keys:
+  dev-home:
+  jetbrains-cache:

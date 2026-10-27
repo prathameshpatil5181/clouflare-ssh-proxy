@@ -1,0 +1,28 @@
+[package]
+name = "cfssh-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "OpenSSH ProxyCommand helper: bridges SSH over a Cloudflare Tunnel WebSocket (no local cloudflared needed)"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+# ring is selected explicitly and installed in main() so TLS never fails with
+# "could not automatically determine the process-level CryptoProvider".
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

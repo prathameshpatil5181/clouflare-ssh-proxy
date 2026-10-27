@@ -1,0 +1,3 @@
+# Local dev note: this machine has no system-wide C toolchain available to CI
+# zombies; keep the generic defaults. Nothing machine-specific is committed.
+# (Intentionally minimal; all configuration is in Cargo.toml.)
