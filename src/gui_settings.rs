@@ -32,6 +32,9 @@ pub struct GuiSettings {
     /// WebSocket ping keepalive interval in seconds.
     #[serde(default = "default_keepalive")]
     pub keepalive_secs: u64,
+    /// Login user put in the managed ssh-config block (VS Code/Gateway).
+    #[serde(default = "default_ssh_user")]
+    pub ssh_user: String,
 }
 
 impl Default for GuiSettings {
@@ -44,6 +47,7 @@ impl Default for GuiSettings {
             bind: default_bind(),
             lan_reachable: false,
             keepalive_secs: default_keepalive(),
+            ssh_user: default_ssh_user(),
         }
     }
 }
@@ -53,6 +57,9 @@ fn default_bind() -> String {
 }
 fn default_keepalive() -> u64 {
     25
+}
+fn default_ssh_user() -> String {
+    crate::ssh_config::DEFAULT_USER.to_string()
 }
 
 impl GuiSettings {

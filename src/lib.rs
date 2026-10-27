@@ -9,6 +9,7 @@ pub mod error;
 pub mod gui_settings;
 pub mod known_hosts;
 pub mod probe;
+pub mod ssh_config;
 pub mod subcommands;
 pub mod tunnel;
 

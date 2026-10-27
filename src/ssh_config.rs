@@ -49,8 +49,8 @@ pub enum EnsureOutcome {
     Unchanged,
 }
 
-/// Idempotently make the managed block say what it should. Other content is
-/// preserved byte-for-byte. One isolated dir-suffix is tolerated (see below).
+/// Idempotently make the managed block say what it should. Content outside
+/// the markers is preserved byte-for-byte.
 pub fn ensure(
     path: &Path,
     alias: &str,
@@ -61,32 +61,38 @@ pub fn ensure(
     let desired = block(alias, listen_host, port, user);
     let text = std::fs::read_to_string(path).unwrap_or_default();
 
-    // What does the file already contain as the managed region?
-    let region: Option<std::ops::Range<usize>> = {
-        match (text.find(MANAGED_START), text.find(MANAGED_END)) {
-            (Some(s), Some(e)) if e > s => Some(s..e + MANAGED_END.len()),
-            // A stray unclosed start marker (crash mid-write, manual paste):
-            // drop just that line and treat as unmanaged.
-            (Some(s), _) => {
-                let mut trimmed = String::with_capacity(text.len());
-                trimmed.push_str(&text[..s]);
-                let after = &text[s..];
-                trimmed.push_str(after.find('\n').map(|n| &after[n + 1..]).unwrap_or(""));
-                let _ = std::fs::write(path, &trimmed);
-                None
-            }
-            _ => None,
+    // Locate the currently managed region, or heal a stray unclosed marker.
+    let region: Option<std::ops::Range<usize>> = match (
+        text.find(MANAGED_START),
+        text.find(MANAGED_END),
+    ) {
+        (Some(s), Some(e)) if e > s => Some(s..e + MANAGED_END.len()),
+        (Some(s), _) => {
+            // A start without an end (manual paste / crash mid-write): treat
+            // the stray marker line as unmanaged junk to keep, minus itself.
+            let after = &text[s..];
+            let body = after.find('\n').map(|n| &after[n + 1..]).unwrap_or("");
+            let kept = format!("{}{body}", &text[..s]);
+            write_with_permissions(path, &kept)?;
+            return Ok((EnsureOutcome::Added, count_hosts(path)?));
         }
+        _ => None,
     };
 
     if let Some(r) = &region {
-        if text[r.clone()] == *desired {
+        if text[r.clone()] == desired {
             return Ok((EnsureOutcome::Unchanged, count_hosts(path)?));
         }
     }
 
     let new_text = match region {
-        Some(r) => format!("{}{}{}", &text[..r.start], desired, &text[r.end + 1..].replace("", "")),
+        Some(r) => {
+            let mut out = String::with_capacity(text.len());
+            out.push_str(&text[..r.start]);
+            out.push_str(&desired);
+            out.push_str(&text[r.end..]);
+            out
+        }
         None => {
             let mut t = text;
             if !t.is_empty() && !t.ends_with('\n') {
@@ -96,17 +102,6 @@ pub fn ensure(
             t
         }
     };
-    if region.is_some() {
-        // The simplest splice: replace [start..end] exactly.
-        let mut t = text;
-        let (s, e) = (region.as_ref().unwrap().start, region.as_ref().unwrap().end);
-        let mut out = String::with_capacity(t.len());
-        out.push_str(&t[..s]);
-        out.push_str(&desired);
-        out.push_str(&t[e..]);
-        out.pop_or_normalize();
-        t = out;
-    }
     write_with_permissions(path, &new_text)?;
     let outcome = if region.is_some() {
         EnsureOutcome::Updated
@@ -149,7 +144,10 @@ pub fn remove_managed(path: &Path) -> Result<usize, Error> {
         return Ok(0);
     }
     out.push_str(rest);
-    write_with_permissions(path, out.trim_end_matches('\n').add_nl())?;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    write_with_permissions(path, &out)?;
     Ok(removed)
 }
 
@@ -176,7 +174,7 @@ pub fn count_hosts(path: &Path) -> Result<usize, Error> {
 
 fn write_with_permissions(path: &Path, text: &str) -> Result<(), Error> {
     use std::io::Write as _;
-    let tmp = path.with_extension(format!("cfssh.tmp"));
+    let tmp = path.with_extension("cfssh.tmp");
     {
         let mut f = std::fs::File::create(&tmp)
             .map_err(|e| Error::WsSetup(format!("cannot create {}: {e}", tmp.display())))?;
@@ -193,21 +191,6 @@ fn write_with_permissions(path: &Path, text: &str) -> Result<(), Error> {
         Error::WsSetup(format!("cannot rename {} -> {}: {e}", tmp.display(), path.display()))
     })?;
     Ok(())
-}
-
-trait TrimExt {
-    fn add_nl(&self) -> String;
-    fn pop_or_normalize(&mut self);
-}
-impl TrimExt for str {
-    fn add_nl(&self) -> String {
-        let mut s = self.to_string();
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-        s
-    }
-    fn pop_or_normalize(&mut self) {}
 }
 
 #[cfg(test)]
