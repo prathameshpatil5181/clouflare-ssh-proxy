@@ -60,11 +60,43 @@ fn main() -> eframe::Result {
         Default::default()
     });
 
+    // Exactly one GUI per user: a second copy of the app is the classic
+    // "one window works, the other says Disconnected forever" trap — it
+    // cannot bind the forwarder port. Advisory lock file, released at exit.
+    match acquire_instance_lock() {
+        Ok(()) => {}
+        Err(_) => {
+            eprintln!(
+                "cfssh-gui: another instance is already running — use its window (nothing started)."
+            );
+            return Ok(());
+        }
+    }
+
     eframe::run_native(
         "cfssh-proxy",
         options,
         Box::new(move |_cc| Ok(Box::new(App::new(settings)))),
     )
+}
+
+/// Advisory single-instance lock; Ok only exactly once per user profile.
+fn acquire_instance_lock() -> Result<(), std::io::Error> {
+    let mut dir = dirs::config_dir().ok_or_else(|| std::io::Error::other("no config dir"))?;
+    dir.push("cfssh-proxy");
+    std::fs::create_dir_all(&dir)?;
+    dir.push("app.lock");
+    let mut f = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&dir)?;
+    f.try_lock()?;
+    let _ = std::io::Write::write_all(&mut f, format!("pid={}\n", std::process::id()).as_bytes());
+    // Intentionally leak: the lock must live for the whole process, and the
+    // OS releases it on exit.
+    Box::leak(Box::new(f));
+    Ok(())
 }
 
 struct LogSink(LogRing);
@@ -155,6 +187,8 @@ struct App {
     settings_error: Option<String>,
     ssh_entry_state: Option<cfp::ssh_config::EnsureOutcome>,
     ssh_entry_error: Option<String>,
+    /// why the last Connect attempt did not reach Connected (bind failure etc.)
+    last_error: Option<String>,
     tray: Option<tray::Tray>,
     quit: bool,
 }
@@ -177,6 +211,7 @@ impl App {
             settings_error: None,
             ssh_entry_state: None,
             ssh_entry_error: None,
+            last_error: None,
             tray: tray::Tray::create(),
             quit: false,
             runtime,
@@ -251,6 +286,7 @@ impl App {
             return;
         }
         self.settings_error = None;
+        self.last_error = None;
         let url = match cfp::config::normalize_target(&self.settings.target, false) {
             Ok(u) => u,
             Err(e) => {
@@ -393,6 +429,7 @@ impl App {
                 match ev {
                     ForwarderEvent::Listening { addr } => {
                         self.status = Status::Listening { addr };
+                        self.last_error = None;
                         if let Some(t) = self.tray.as_mut() {
                             t.set_connected(true);
                         }
@@ -404,6 +441,7 @@ impl App {
                     ForwarderEvent::Stopped { error } => {
                         if let Some(e) = error {
                             tracing::error!("forwarder stopped: {e}");
+                            self.last_error = Some(e);
                         }
                         self.engine = None;
                         self.status = Status::Disconnected;
@@ -444,6 +482,21 @@ impl App {
         } else {
             Duration::from_secs(30)
         });
+    }
+}
+
+/// Human phrasing for the common forwarder startup failures.
+fn rc_error_text(err: &str) -> String {
+    if err.contains("cannot listen on")
+        && (err.contains("already in use")
+            || err.contains("os error 98")
+            || err.contains("os error 10048"))
+    {
+        format!(
+            "{err}\nThe port is taken — usually a second app instance (now              prevented) or an old `cfssh-proxy --listen` still running."
+        )
+    } else {
+        format!("could not start the forwarder: {err}")
     }
 }
 
@@ -631,6 +684,12 @@ impl App {
         ui.add(egui::Label::new(
             egui::RichText::new(text).strong().size(15.0).color(color),
         ));
+        if let Some(err) = &self.last_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xE8, 0x60, 0x50),
+                rc_error_text(err),
+            );
+        }
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
