@@ -219,6 +219,9 @@ async fn scan_and_pin(args: &TrustArgs, r: &TrustResolved) -> Result<(), Error> 
         .local_addr()
         .map_err(|e| Error::WsSetup(format!("scan listener: {e}")))?
         .port();
+    let listen_addr = listener
+        .local_addr()
+        .map_err(|e| Error::WsSetup(format!("scan listener: {e}")))?;
     tracing::debug!("scan listener on 127.0.0.1:{listen_port} -> {}", r.url);
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -252,95 +255,33 @@ async fn scan_and_pin(args: &TrustArgs, r: &TrustResolved) -> Result<(), Error> 
         }
     });
 
-    // 2. ssh-keyscan speaks the SSH protocol over that local port.
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::process::Command::new("ssh-keyscan")
-            .args([
-                "-T", // per-connection timeout (round-trips through the edge)
-                "15",
-                "-p",
-                &listen_port.to_string(),
-                "127.0.0.1", // the scan is addressed by its own port; rewritten below
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => Error::WsSetup(
-                    "ssh-keyscan not found. It ships with OpenSSH client tools \
-                     (openssh-client on Debian/Ubuntu, alongside `ssh`)."
-                        .to_string(),
-                ),
-                _ => Error::Io(format!("cannot run ssh-keyscan: {e}")),
-            })
-    })
-    .await
-    .map_err(|_| {
-        Error::WsSetup(
-            "ssh-keyscan timed out while scanning through the tunnel \
-             (is the tunnel up and the origin sshd running?)"
-                .to_string(),
-        )
-    })??;
+    // 2. Pure-Rust SSH2 KEX probe over that local port — no ssh-keyscan
+    // dependency, so this works identically on a bare Windows GUI install.
+    let keys = crate::probe::probe_host_keys(listen_addr).await?;
 
     let _ = stop_tx.send(());
     accept_loop.abort();
 
-    // 3. Parse key lines: `127.0.0.1[:p] ssh-ed25519 AAAA… [comment]`.
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    let mut pins: Vec<(String, String)> = Vec::new(); // (fingerprint, line-without-host)
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        let _host_field = it.next(); // not used; rewritten below
-        let Some(keytype) = it.next() else { continue };
-        let Some(blob) = it.next() else { continue };
-        if !(keytype.starts_with("ssh-") || keytype.starts_with("ecdsa-")) {
-            continue;
-        }
-        let fp = known_hosts::fingerprint(blob)?;
-        let rest: Vec<&str> = std::iter::once(keytype)
-            .chain(std::iter::once(blob))
-            .chain(it.collect::<Vec<_>>())
-            .collect();
-        pins.push((fp, rest.join(" ")));
-    }
+    let pins: Vec<String> = keys.iter().map(|k| k.pin_line()).collect();
 
-    if pins.is_empty() {
-        let stderr_tail = String::from_utf8_lossy(&result.stderr);
-        let tail: Vec<&str> = stderr_tail.lines().rev().take(5).collect();
-        return Err(Error::WsSetup(format!(
-            "ssh-keyscan captured no host keys through the tunnel. Likely causes: the origin sshd \
-             is down (container recreated?), wrong tunnel target, or the Access policy rejected us. \
-             Recent keyscan errors: {}",
-            if tail.is_empty() { "(none)".to_string() } else { tail.join(" | ") }
-        )));
-    }
-
-    // 4. Un-trust old pins for the client form, then pin the fresh keys.
+    // 3. Un-trust old pins for the client form, then pin the fresh keys.
     let kh_path = match args.known_hosts.clone() {
         Some(p) => p,
         None => default_known_hosts()?,
     };
     let removed = known_hosts::remove_entries(&kh_path, std::slice::from_ref(&r.client))?;
-    let lines: Vec<String> = pins.iter().map(|(_, l)| l.clone()).collect();
-    let added = known_hosts::append_entries(&kh_path, &r.client, &lines)?;
+    let added = known_hosts::append_entries(&kh_path, &r.client, &pins)?;
 
     out(std::format_args!(
         "cfssh-proxy: pinned {added} key(s) for {} in {} (replaced {removed} old pin(s))",
         r.client.pin_host(),
         kh_path.display()
     ));
-    for (fp, line) in &pins {
+    for key in &keys {
         out(std::format_args!(
             "cfssh-proxy:   {} ({})",
-            fp,
-            line.split(' ').next().unwrap_or("")
+            key.fingerprint,
+            key.keytype
         ));
     }
     out(std::format_args!(

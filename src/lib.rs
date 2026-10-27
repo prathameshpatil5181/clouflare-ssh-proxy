@@ -6,7 +6,9 @@ pub mod bridge;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod gui_settings;
 pub mod known_hosts;
+pub mod probe;
 pub mod subcommands;
 pub mod tunnel;
 

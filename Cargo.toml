@@ -33,6 +33,9 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
+# Pure-Rust SSH2 host-key probe (GUI trust flow; no external ssh-keyscan).
+# ring feature keeps crypto in ring — avoids aws-lc-rs/CMake on the Windows build.
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
