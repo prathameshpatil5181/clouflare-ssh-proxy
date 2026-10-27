@@ -52,3 +52,8 @@ lto = true
 strip = true
 panic = "abort"
 codegen-units = 1
+
+# Tray icon — Windows-only first. The tray module in the GUI is cfg(windows);
+# other platforms keep the plain window until tray support is wanted there.
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"

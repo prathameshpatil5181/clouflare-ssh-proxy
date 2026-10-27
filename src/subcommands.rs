@@ -153,7 +153,7 @@ pub struct TrustArgs {
 
 /// Strip scheme/URL parts from the target so defaults match what the user
 /// actually types as the ssh hostname.
-fn plain_host(target: &str) -> String {
+pub fn plain_host(target: &str) -> String {
     let t = target.trim().trim_end_matches('/');
     let after_scheme = t
         .split_once("://")
@@ -177,40 +177,94 @@ struct TrustResolved {
     keepalive: Duration,
 }
 
-fn resolve_trust(args: &TrustArgs) -> Result<TrustResolved, Error> {
-    let cli = CliCredentials {
-        client_id: args.client_id.clone(),
-        client_secret: args.client_secret.clone(),
-    };
-    let creds = config::resolve_credentials(
-        &cli,
-        &EnvSource::from_real_env(),
-        args.token_file.as_deref(),
-        args.allow_insecure_perms,
-    )?;
-    let url = config::normalize_target(&args.target, args.insecure_ws)?;
-    let host = args
-        .client_host
-        .clone()
-        .unwrap_or_else(|| plain_host(&args.target));
-    Ok(TrustResolved {
-        url,
-        creds,
-        client: HostPort::new(host, args.client_port),
-        keepalive: Duration::from_secs(args.keepalive_secs.max(1)),
-    })
-}
-
 pub fn run_trust(args: &TrustArgs) -> Result<(), Error> {
-    let resolved = resolve_trust(args)?;
+    let req = TrustRequest {
+        target: args.target.clone(),
+        credentials: {
+            let cli = CliCredentials {
+                client_id: args.client_id.clone(),
+                client_secret: args.client_secret.clone(),
+            };
+            config::resolve_credentials(
+                &cli,
+                &EnvSource::from_real_env(),
+                args.token_file.as_deref(),
+                args.allow_insecure_perms,
+            )?
+        },
+        client: HostPort::new(
+            args.client_host
+                .clone()
+                .unwrap_or_else(|| plain_host(&args.target)),
+            args.client_port,
+        ),
+        known_hosts: args.known_hosts.clone(),
+        keepalive: Duration::from_secs(args.keepalive_secs.max(1)),
+        insecure_ws: args.insecure_ws,
+    };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to start async runtime");
-    rt.block_on(scan_and_pin(args, &resolved))
+    let outcome = rt.block_on(learn_and_pin(&req))?;
+    out(std::format_args!(
+        "cfssh-proxy: pinned {} key(s) for {} in {} (replaced {} old pin(s))",
+        outcome.pinned,
+        req.client.pin_host(),
+        outcome.known_hosts.display(),
+        outcome.replaced
+    ));
+    for key in &outcome.keys {
+        out(std::format_args!(
+            "cfssh-proxy:   {} ({})",
+            key.fingerprint,
+            key.keytype
+        ));
+    }
+    out(std::format_args!(
+        "cfssh-proxy: connect now with `ssh -p {} {}` — the key above is the one sshd presented",
+        req.client.port.unwrap_or(22),
+        req.client.host
+    ));
+    Ok(())
 }
 
-async fn scan_and_pin(args: &TrustArgs, r: &TrustResolved) -> Result<(), Error> {
+/// Everything learn_and_pin needs; shared by the CLI `trust` and the GUI's
+/// Trust button.
+#[derive(Debug, Clone)]
+pub struct TrustRequest {
+    /// Tunnel target exactly like the connect mode (bare host or URL).
+    pub target: String,
+    /// Cloudflare Access service token, or None for anonymous connect.
+    pub credentials: Option<config::Credentials>,
+    /// The host form the ssh CLIENT connects to (e.g. 127.0.0.1:22022).
+    pub client: HostPort,
+    /// known_hosts file (None = ~/.ssh/known_hosts).
+    pub known_hosts: Option<PathBuf>,
+    pub keepalive: Duration,
+    /// Test-only ws:// allowance (never exposed in the GUI).
+    pub insecure_ws: bool,
+}
+
+/// What learn_and_pin produced — the GUI renders this directly.
+#[derive(Debug, Clone)]
+pub struct TrustOutcome {
+    pub keys: Vec<crate::probe::HostKey>,
+    pub known_hosts: PathBuf,
+    pub pinned: usize,
+    pub replaced: usize,
+}
+
+/// Learn the CURRENT sshd host keys through the tunnel and pin them for the
+/// client endpoint. One-shot ephemeral listener -> russh KEX probe -> replace
+/// the pins. Never sends credentials; captures fingerprints only.
+pub async fn learn_and_pin(req: &TrustRequest) -> Result<TrustOutcome, Error> {
+    let r = TrustResolved {
+        url: config::normalize_target(&req.target, req.insecure_ws)?,
+        creds: req.credentials.clone(),
+        client: req.client.clone(),
+        keepalive: req.keepalive,
+    };
     // 1. One-shot ephemeral listener that tunnels local TCP -> the origin sshd.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -265,29 +319,17 @@ async fn scan_and_pin(args: &TrustArgs, r: &TrustResolved) -> Result<(), Error> 
     let pins: Vec<String> = keys.iter().map(|k| k.pin_line()).collect();
 
     // 3. Un-trust old pins for the client form, then pin the fresh keys.
-    let kh_path = match args.known_hosts.clone() {
+    let kh_path = match req.known_hosts.clone() {
         Some(p) => p,
         None => default_known_hosts()?,
     };
     let removed = known_hosts::remove_entries(&kh_path, std::slice::from_ref(&r.client))?;
     let added = known_hosts::append_entries(&kh_path, &r.client, &pins)?;
 
-    out(std::format_args!(
-        "cfssh-proxy: pinned {added} key(s) for {} in {} (replaced {removed} old pin(s))",
-        r.client.pin_host(),
-        kh_path.display()
-    ));
-    for key in &keys {
-        out(std::format_args!(
-            "cfssh-proxy:   {} ({})",
-            key.fingerprint,
-            key.keytype
-        ));
-    }
-    out(std::format_args!(
-        "cfssh-proxy: connect now with `ssh -p {} {}` — the key above is the one sshd presented",
-        r.client.port.unwrap_or(22),
-        r.client.host
-    ));
-    Ok(())
+    Ok(TrustOutcome {
+        keys,
+        known_hosts: kh_path,
+        pinned: added,
+        replaced: removed,
+    })
 }

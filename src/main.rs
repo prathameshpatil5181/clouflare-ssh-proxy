@@ -172,6 +172,10 @@ fn run(args: &Args) -> Result<(), Error> {
                                 let _ = writeln!(out, "cfssh-proxy: connection error: {e}");
                             }
                             ForwarderEvent::SessionEnded { error: None } => {}
+                            ForwarderEvent::Stopped { error: Some(e) } => {
+                                let _ = writeln!(out, "cfssh-proxy: forwarder stopped: {e}");
+                            }
+                            ForwarderEvent::Stopped { error: None } => {}
                         }
                     }
                 }

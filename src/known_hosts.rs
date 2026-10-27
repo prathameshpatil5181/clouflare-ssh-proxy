@@ -51,6 +51,29 @@ impl HostPort {
     }
 }
 
+/// List the currently pinned lines (all key types) for one endpoint, without
+/// modifying the file. Used by GUIs to show what the client currently trusts.
+pub fn list_entries(path: &Path, endpoint: &HostPort) -> Result<Vec<String>, Error> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(Error::WsSetup(format!(
+                "cannot read known_hosts {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let candidates = endpoint.candidates();
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let hosts = line.split_whitespace().next()?;
+            hosts_part_matches(hosts, &candidates).then(|| line.to_string())
+        })
+        .collect())
+}
+
 fn is_hashed(host_field: &str) -> bool {
     host_field.starts_with("|1|")
 }

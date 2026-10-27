@@ -54,6 +54,29 @@ pub enum ForwarderEvent {
     Accepted,
     /// One bridged session ended (client or tunnel side closed).
     SessionEnded { error: Option<String> },
+    /// The forwarder itself stopped (shutdown triggered, or error).
+    Stopped { error: Option<String> },
+}
+
+/// Start a forwarder on `rt` and return its control channels. The GUI calls
+/// this; the CLI uses the never-shutdown variant directly.
+pub fn spawn_forwarder(
+    rt: &tokio::runtime::Runtime,
+    cfg: ForwarderConfig,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<ForwarderEvent>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let stop_tx = ev_tx.clone();
+    rt.spawn(async move {
+        let result = run_forwarder(&cfg, ev_tx, shutdown_rx).await;
+        let _ = stop_tx.send(ForwarderEvent::Stopped {
+            error: result.err().map(|e| e.to_string()),
+        });
+    });
+    (ev_rx, shutdown_tx)
 }
 
 /// Run the forwarder until `shutdown` flips to `true`, then return Ok(()) after
