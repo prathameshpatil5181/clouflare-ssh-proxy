@@ -1,17 +1,12 @@
-mod bridge;
-mod config;
-mod error;
-mod known_hosts;
-mod subcommands;
-mod tunnel;
-
 use std::io::Write as _;
 use std::time::Duration;
 use std::time::Instant;
 
+use cfp::config::{CliCredentials, EnvSource};
+use cfp::engine::{ForwarderConfig, ForwarderEvent};
+use cfp::error::Error;
+use cfssh_proxy as cfp;
 use clap::Parser;
-use config::{CliCredentials, EnvSource};
-use error::Error;
 
 /// OpenSSH ProxyCommand helper: bridges local SSH (stdin/stdout) to an SSH
 /// endpoint published through a Cloudflare Tunnel (WebSocket), authenticating
@@ -77,29 +72,23 @@ fn init_tracing(verbose: bool) {
     }
 }
 
-fn install_crypto_provider() {
-    // Selecting explicitly (ring) avoids rustls' ambiguous-provider panic when
-    // multiple backends end up unified in the dependency tree.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-    install_crypto_provider();
+    cfp::install_crypto_provider();
 
     let code = match argv.get(1).map(String::as_str) {
         Some("untrust") => {
-            let a = subcommands::UntrustArgs::parse_from(
+            let a = cfp::subcommands::UntrustArgs::parse_from(
                 std::iter::once("cfssh-proxy".to_string()).chain(argv.into_iter().skip(2)),
             );
-            let r = subcommands::run_untrust(&a);
+            let r = cfp::subcommands::run_untrust(&a);
             finish(r)
         }
         Some("trust") => {
-            let a = subcommands::TrustArgs::parse_from(
+            let a = cfp::subcommands::TrustArgs::parse_from(
                 std::iter::once("cfssh-proxy".to_string()).chain(argv.into_iter().skip(2)),
             );
-            let r = subcommands::run_trust(&a);
+            let r = cfp::subcommands::run_trust(&a);
             finish(r)
         }
         _ => {
@@ -129,15 +118,84 @@ fn run(args: &Args) -> Result<(), Error> {
         client_secret: args.client_secret.clone(),
     };
 
-    let creds = config::resolve_credentials(
+    let keepalive = Duration::from_secs(args.keepalive_secs.max(1));
+    if let Some(listen) = &args.listen {
+        let cfg = ForwarderConfig {
+            target: args.host.clone(),
+            credentials: None, // resolved below so errors follow the CLI chain
+            bind: listen.clone(),
+            keepalive,
+            insecure_ws: args.insecure_ws,
+        }
+        .resolve(
+            &cli,
+            &EnvSource::from_real_env(),
+            args.token_file.as_deref(),
+            args.allow_insecure_perms,
+        )?;
+        match &cfg.credentials {
+            Some(c) => {
+                tracing::debug!(%listen, client_id = %c.client_id, "forwarder (with Access service token)")
+            }
+            None => {
+                tracing::debug!(%listen, "forwarder (no Access service token; connecting without Access headers)")
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to start async runtime");
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let result = rt.block_on(async {
+            // Event printer: stderr only, exact historical wording (tests parse
+            // the port out of the "listening on" line). Spawned inside the
+            // runtime — outside it tokio::spawn panics.
+            let printer = tokio::spawn({
+                let mut ev_rx = ev_rx;
+                async move {
+                    let stderr = std::io::stderr();
+                    while let Some(ev) = ev_rx.recv().await {
+                        let mut out = stderr.lock();
+                        match ev {
+                            ForwarderEvent::Listening { addr } => {
+                                let _ = writeln!(out, "cfssh-proxy: listening on {addr}");
+                                let _ = writeln!(
+                                    out,
+                                    "cfssh-proxy: IntelliJ/Gateway: Host 127.0.0.1, Port {} (User dev; password auth — no proxy settings needed)",
+                                    addr.port()
+                                );
+                            }
+                            ForwarderEvent::Accepted => {}
+                            ForwarderEvent::SessionEnded { error: Some(e) } => {
+                                let _ = writeln!(out, "cfssh-proxy: connection error: {e}");
+                            }
+                            ForwarderEvent::SessionEnded { error: None } => {}
+                        }
+                    }
+                }
+            });
+            let result = cfp::engine::run_forwarder(&cfg, ev_tx, shutdown_rx).await;
+            printer.abort();
+            result
+        });
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "listener stopped"
+        );
+        result?;
+        return Ok(());
+    }
+
+    let creds = cfp::config::resolve_credentials(
         &cli,
         &EnvSource::from_real_env(),
         args.token_file.as_deref(),
         args.allow_insecure_perms,
     )?;
 
-    let url_string = config::normalize_target(&args.host, args.insecure_ws)?;
-    let keepalive = Duration::from_secs(args.keepalive_secs.max(1));
+    let url_string = cfp::config::normalize_target(&args.host, args.insecure_ws)?;
     match &creds {
         Some(c) => tracing::debug!(
             %url_string,
@@ -157,16 +215,6 @@ fn run(args: &Args) -> Result<(), Error> {
         .build()
         .expect("failed to start async runtime");
 
-    if let Some(listen) = &args.listen {
-        let creds_owned = creds.clone();
-        rt.block_on(listen_mode(listen, &url_string, creds_owned, keepalive))?;
-        tracing::debug!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "listener stopped"
-        );
-        return Ok(());
-    }
-
     rt.block_on(run_bridge(&url_string, creds.as_ref(), keepalive))?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -177,60 +225,10 @@ fn run(args: &Args) -> Result<(), Error> {
 
 async fn run_bridge(
     url: &str,
-    creds: Option<&config::Credentials>,
+    creds: Option<&cfp::config::Credentials>,
     keepalive: Duration,
 ) -> Result<(), Error> {
-    let ws = tunnel::connect_ws(url, creds).await?;
-    let stdin_rx = bridge::spawn_stdin_reader();
-    bridge::run(ws, stdin_rx, keepalive).await
-}
-
-/// Listen mode: accept TCP connections locally and bridge each one through a
-/// fresh WebSocket to the tunnel. Run forever (Ctrl-C stops it).
-async fn listen_mode(
-    listen: &str,
-    url: &str,
-    creds: Option<config::Credentials>,
-    keepalive: Duration,
-) -> Result<(), Error> {
-    let bind_addr = if listen.contains(':') {
-        listen.to_string()
-    } else {
-        format!("127.0.0.1:{listen}")
-    };
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|e| Error::WsSetup(format!("cannot listen on {bind_addr}: {e}")))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| Error::WsSetup(format!("listener has no address: {e}")))?
-        .port();
-
-    // Machine-readable first line; humans get a hint for their IDE.
-    let _ = writeln!(
-        std::io::stderr(),
-        "cfssh-proxy: listening on 127.0.0.1:{port}"
-    );
-    let _ = writeln!(
-        std::io::stderr(),
-        "cfssh-proxy: IntelliJ/Gateway: Host 127.0.0.1, Port {port} (User dev; password auth — no proxy settings needed)"
-    );
-
-    loop {
-        match listener.accept().await {
-            Ok((sock, _)) => {
-                let url_s = url.to_string();
-                let creds_c = creds.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tunnel::serve_conn(sock, &url_s, creds_c, keepalive).await {
-                        let _ = writeln!(std::io::stderr(), "cfssh-proxy: connection error: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "listen accept failed; continuing");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
+    let ws = cfp::tunnel::connect_ws(url, creds).await?;
+    let stdin_rx = cfp::bridge::spawn_stdin_reader();
+    cfp::bridge::run(ws, stdin_rx, keepalive).await
 }

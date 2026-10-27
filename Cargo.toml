@@ -5,7 +5,27 @@ edition = "2021"
 description = "OpenSSH ProxyCommand helper: bridges SSH over a Cloudflare Tunnel WebSocket (no local cloudflared needed)"
 license = "MIT"
 
+[lib]
+name = "cfssh_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cfssh-proxy"
+path = "src/main.rs"
+
+# GUI only ships on Windows today; `--features gui` gates the heavy deps so
+# CI/unit tests stay lean. The same eframe code is the future mac/linux UI.
+[[bin]]
+name = "cfssh-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["dep:eframe"]
+
 [dependencies]
+eframe = { version = "0.29", optional = true, default-features = false, features = ["glow", "x11", "wayland"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "process"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 # ring is selected explicitly and installed in main() so TLS never fails with
