@@ -37,13 +37,14 @@ fn main() -> eframe::Result {
     let renderer = match std::env::var("CFSSH_RENDERER").as_deref() {
         Ok("wgpu") => eframe::Renderer::Wgpu,
         Ok("glow") => eframe::Renderer::Glow,
-        _ => if std::env::var_os("WSL_DISTRO_NAME").is_some()
-            || std::env::var_os("WSLENV").is_some()
-        {
-            eframe::Renderer::Wgpu // WSLg fallback
-        } else {
-            eframe::Renderer::Glow // native Windows default
-        },
+        _ => {
+            if std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSLENV").is_some()
+            {
+                eframe::Renderer::Wgpu // WSLg fallback
+            } else {
+                eframe::Renderer::Glow // native Windows default
+            }
+        }
     };
     let options = eframe::NativeOptions {
         renderer,
@@ -62,21 +63,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "cfssh-proxy",
         options,
-        Box::new(move |cc| {
-            if let Ok(v) = std::env::var("CFSSH_PPP") {
-                if let Ok(f) = v.parse::<f32>() {
-                    cc.egui_ctx.set_pixels_per_point(f);
-                }
-            }
-            let fonts = egui::FontDefinitions::default();
-            println!(
-                "fonts: {} families, {} fonts, {} bytes loaded",
-                fonts.families.len(),
-                fonts.font_data.len(),
-                fonts.font_data.values().map(|d| d.font.len()).sum::<usize>(),
-            );
-            Ok(Box::new(App::new(settings)))
-        }),
+        Box::new(move |_cc| Ok(Box::new(App::new(settings)))),
     )
 }
 
@@ -166,6 +153,8 @@ struct App {
     trust_result: Option<Result<TrustOutcome, String>>,
     known_entries: Vec<String>,
     settings_error: Option<String>,
+    ssh_entry_state: Option<cfp::ssh_config::EnsureOutcome>,
+    ssh_entry_error: Option<String>,
     tray: Option<tray::Tray>,
     quit: bool,
 }
@@ -186,6 +175,8 @@ impl App {
             trust_result: None,
             known_entries: Vec::new(),
             settings_error: None,
+            ssh_entry_state: None,
+            ssh_entry_error: None,
             tray: tray::Tray::create(),
             quit: false,
             runtime,
@@ -194,6 +185,66 @@ impl App {
     }
 
     // ---- actions -------------------------------------------------------
+
+    fn write_ssh_entry(&mut self) {
+        let port = self
+            .settings
+            .bind_addr()
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok());
+        let Some(port) = port else {
+            self.ssh_entry_error = Some("the forwarder port must be a plain number".to_string());
+            return;
+        };
+        let matches_block = |text: &str, want: &str| {
+            use cfp::ssh_config as sc;
+            match (text.find(sc::MANAGED_START), text.find(sc::MANAGED_END)) {
+                (Some(s), Some(e)) if e > s => text.get(s..e + sc::MANAGED_END.len()) == Some(want),
+                _ => false,
+            }
+        };
+        let path = match cfp::ssh_config::path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.ssh_entry_error = Some(e.to_string());
+                return;
+            }
+        };
+        // Preview first so an exact match can short-circuit without rewriting.
+        let want = cfp::ssh_config::block(
+            cfp::ssh_config::DEFAULT_ALIAS,
+            cfp::ssh_config::LISTEN_HOST,
+            port,
+            &self.settings.ssh_user,
+        );
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if matches_block(&existing, &want) {
+            self.ssh_entry_state = Some(cfp::ssh_config::EnsureOutcome::Unchanged);
+            self.ssh_entry_error = None;
+            return;
+        }
+        match cfp::ssh_config::ensure(
+            &path,
+            cfp::ssh_config::DEFAULT_ALIAS,
+            cfp::ssh_config::LISTEN_HOST,
+            port,
+            &self.settings.ssh_user,
+        ) {
+            Ok((outcome, hosts)) => {
+                tracing::info!(
+                    "ssh config: {:?} for Host {} ({} managed host(s)) in {}",
+                    outcome,
+                    cfp::ssh_config::DEFAULT_ALIAS,
+                    hosts,
+                    path.display()
+                );
+                self.ssh_entry_state = Some(outcome);
+                self.ssh_entry_error = None;
+                self.settings.save().ok();
+            }
+            Err(e) => self.ssh_entry_error = Some(format!("ssh config: {e}")),
+        }
+    }
 
     fn connect(&mut self) {
         if self.engine.is_some() {
@@ -426,11 +477,37 @@ impl eframe::App for App {
             ui.label(egui::RichText::new(&ep).monospace().size(15.0));
             ui.add_space(6.0);
             ui.label(
-                "IntelliJ/Gateway: Host + Port above, User dev (password auth; no proxy settings).",
+                "VS Code Remote-SSH / IntelliJ Gateway: Host + Port above \
+                 (User dev by default; password auth; no proxy settings).",
             );
             ui.add_space(6.0);
             if ui.button("Copy endpoint").clicked() {
                 ui.ctx().copy_text(ep.clone());
+            }
+            ui.add_space(4.0);
+            // One click writes/repairs the managed `Host` block in
+            // ~/.ssh/config so Remote-SSH shows this tunnel as "cfssh-dev".
+            if ui.button("Write ssh config entry (VS Code)").clicked() {
+                self.write_ssh_entry();
+            }
+            match self.ssh_entry_state {
+                Some(cfp::ssh_config::EnsureOutcome::Unchanged) => {
+                    ui.label(
+                        egui::RichText::new("config already up to date")
+                            .weak()
+                            .small(),
+                    );
+                }
+                Some(cfp::ssh_config::EnsureOutcome::Added) => {
+                    ui.label(egui::RichText::new("added Host cfssh-dev").weak().small());
+                }
+                Some(cfp::ssh_config::EnsureOutcome::Updated) => {
+                    ui.label(egui::RichText::new("updated Host cfssh-dev").weak().small());
+                }
+                None => {}
+            }
+            if let Some(err) = &self.ssh_entry_error {
+                ui.colored_label(egui::Color32::from_rgb(0xE8, 0x60, 0x50), err);
             }
         });
 
@@ -510,9 +587,19 @@ impl App {
                         .hint_text("22022")
                         .desired_width(120.0),
                 );
-                ui.checkbox(
-                    &mut self.settings.lan_reachable,
-                    "reachable from LAN (Windows may ask about the firewall once)",
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.settings.lan_reachable,
+                        "reachable from LAN (Windows may ask about the firewall once)",
+                    );
+                });
+                ui.end_row();
+
+                ui.label("SSH user");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.ssh_user)
+                        .hint_text("dev")
+                        .desired_width(120.0),
                 );
                 ui.end_row();
             });

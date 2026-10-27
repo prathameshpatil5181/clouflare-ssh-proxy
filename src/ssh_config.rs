@@ -25,17 +25,17 @@ pub fn path() -> Result<PathBuf, Error> {
     let home = dirs::home_dir()
         .ok_or_else(|| Error::WsSetup("cannot locate the home directory".into()))?;
     let dir = home.join(".ssh");
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        Error::WsSetup(format!("cannot create {} (writable?): {e}", dir.display()))
-    })?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::WsSetup(format!("cannot create {} (writable?): {e}", dir.display())))?;
     Ok(dir.join("config"))
 }
 
-/// The exact block text for one endpoint. Deliberately byte-stable: `ensure`
-/// compares this to what is already on disk.
+/// The exact block text for one endpoint (no trailing newline; callers add
+/// separators so `ensure`'s comparison stays byte-stable). Deliberately
+/// byte-stable: `ensure` compares this to what is already on disk.
 pub fn block(alias: &str, listen_host: &str, port: u16, user: &str) -> String {
     format!(
-        "{MANAGED_START}\nHost {alias}\n    HostName {listen_host}\n    Port {port}\n    User {user}\n{MANAGED_END}\n"
+        "{MANAGED_START}\nHost {alias}\n    HostName {listen_host}\n    Port {port}\n    User {user}\n{MANAGED_END}"
     )
 }
 
@@ -62,22 +62,20 @@ pub fn ensure(
     let text = std::fs::read_to_string(path).unwrap_or_default();
 
     // Locate the currently managed region, or heal a stray unclosed marker.
-    let region: Option<std::ops::Range<usize>> = match (
-        text.find(MANAGED_START),
-        text.find(MANAGED_END),
-    ) {
-        (Some(s), Some(e)) if e > s => Some(s..e + MANAGED_END.len()),
-        (Some(s), _) => {
-            // A start without an end (manual paste / crash mid-write): treat
-            // the stray marker line as unmanaged junk to keep, minus itself.
-            let after = &text[s..];
-            let body = after.find('\n').map(|n| &after[n + 1..]).unwrap_or("");
-            let kept = format!("{}{body}", &text[..s]);
-            write_with_permissions(path, &kept)?;
-            return Ok((EnsureOutcome::Added, count_hosts(path)?));
-        }
-        _ => None,
-    };
+    let region: Option<std::ops::Range<usize>> =
+        match (text.find(MANAGED_START), text.find(MANAGED_END)) {
+            (Some(s), Some(e)) if e > s => Some(s..e + MANAGED_END.len()),
+            (Some(s), _) => {
+                // A start without an end (manual paste / crash mid-write): treat
+                // the stray marker line as unmanaged junk to keep, minus itself.
+                let after = &text[s..];
+                let body = after.find('\n').map(|n| &after[n + 1..]).unwrap_or("");
+                let kept = format!("{}{body}", &text[..s]);
+                write_with_permissions(path, &kept)?;
+                return Ok((EnsureOutcome::Added, count_hosts(path)?));
+            }
+            _ => None,
+        };
 
     if let Some(r) = &region {
         if text[r.clone()] == desired {
@@ -85,25 +83,24 @@ pub fn ensure(
         }
     }
 
-    let new_text = match region {
-        Some(r) => {
-            let mut out = String::with_capacity(text.len());
-            out.push_str(&text[..r.start]);
-            out.push_str(&desired);
-            out.push_str(&text[r.end..]);
-            out
+    let had_region = region.is_some();
+    let new_text = if let Some(r) = &region {
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..r.start]);
+        out.push_str(&desired);
+        out.push_str(&text[r.end..]);
+        out
+    } else {
+        let mut t = text;
+        if !t.is_empty() && !t.ends_with('\n') {
+            t.push('\n');
         }
-        None => {
-            let mut t = text;
-            if !t.is_empty() && !t.ends_with('\n') {
-                t.push('\n');
-            }
-            t.push_str(&desired);
-            t
-        }
+        t.push_str(&desired);
+        t.push('\n');
+        t
     };
     write_with_permissions(path, &new_text)?;
-    let outcome = if region.is_some() {
+    let outcome = if had_region {
         EnsureOutcome::Updated
     } else {
         EnsureOutcome::Added
@@ -163,7 +160,9 @@ pub fn count_hosts(path: &Path) -> Result<usize, Error> {
             )))
         }
     };
-    let Some(start) = text.find(MANAGED_START) else { return Ok(0) };
+    let Some(start) = text.find(MANAGED_START) else {
+        return Ok(0);
+    };
     let region = text.get(start..).unwrap_or_default();
     let end = region.find(MANAGED_END).unwrap_or(region.len());
     Ok(region[..end]
@@ -188,7 +187,11 @@ fn write_with_permissions(path: &Path, text: &str) -> Result<(), Error> {
             .map_err(|e| Error::WsSetup(format!("cannot write {}: {e}", tmp.display())))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {
-        Error::WsSetup(format!("cannot rename {} -> {}: {e}", tmp.display(), path.display()))
+        Error::WsSetup(format!(
+            "cannot rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
     })?;
     Ok(())
 }
@@ -198,7 +201,8 @@ mod tests {
     use super::*;
 
     fn tmp_path(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("cfssh-ssh-config-{name}-{}", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("cfssh-ssh-config-{name}-{}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -232,11 +236,7 @@ mod tests {
     #[test]
     fn other_content_is_preserved() {
         let p = tmp_path("preserve");
-        std::fs::write(
-            &p,
-            "Host work\n    HostName git.corp\n    User someone\n",
-        )
-        .unwrap();
+        std::fs::write(&p, "Host work\n    HostName git.corp\n    User someone\n").unwrap();
         let (o, _) = ensure(&p, DEFAULT_ALIAS, LISTEN_HOST, 22022, DEFAULT_USER).unwrap();
         assert_eq!(o, EnsureOutcome::Added);
         let text = std::fs::read_to_string(&p).unwrap();

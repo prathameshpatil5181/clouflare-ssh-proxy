@@ -163,7 +163,7 @@ fn run(args: &Args) -> Result<(), Error> {
                                 let _ = writeln!(out, "cfssh-proxy: listening on {addr}");
                                 let _ = writeln!(
                                     out,
-                                    "cfssh-proxy: IntelliJ/Gateway: Host 127.0.0.1, Port {} (User dev; password auth — no proxy settings needed)",
+                                    "cfssh-proxy: VS Code Remote-SSH / IntelliJ: Host 127.0.0.1, Port {} (User dev; password auth — no proxy settings needed)",
                                     addr.port()
                                 );
                             }

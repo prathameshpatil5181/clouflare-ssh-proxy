@@ -39,6 +39,7 @@ ssh / IntelliJ <-> cfssh-proxy <-> wss://ssh.ppcoder.xyz <-> cloudflared (server
 | `src/engine.rs` | The forwarder engine (`ForwarderConfig`, `ForwarderEvent`, `run_forwarder`, `spawn_forwarder`): one listener → per-connection WS bridges; shutdown via a watch channel. Shared by `--listen`, the GUI, anything future |
 | `src/gui_settings.rs` | Persisted user settings (Windows: `%APPDATA%\cfssh-proxy\config.toml`): target/token/bind/keepalive/LAN flag; half-token saves sanitized to anonymous |
 | `src/probe.rs` | Pure-Rust SSH2 host-key probe (russh): completes KEX, captures every offered host key, aborts before userauth — no ssh-keyscan dependency |
+| `src/ssh_config.rs` | Managed `Host cfssh-dev` block in `~/.ssh/config` (`%USERPROFILE%\.ssh\config`): idempotent `ensure` (Added/Updated/Unchanged), `remove_managed`, byte-stable delimited block, 0600 atomic write — the VS Code Remote-SSH hook |
 | `src/gui/main.rs` | eframe GUI (Windows-first, compiles everywhere): connect panel, status, IDE endpoint hint, logs (tracing ring via writer), host-keys tab, tray hooks; no console in release (`windows_subsystem`) |
 | `src/gui/tray.rs` | Windows tray (state-colored icons, connect/disconnect/quit menu) behind `cfg(windows)`; inert stub on other platforms |
 | `src/subcommands.rs` | `untrust`/`trust` implementation + pub `learn_and_pin(TrustRequest)->TrustOutcome` shared with the GUI: endpoint parsing (`host:port` tokens, `-p` duality), one-shot accept loop + probe, pin + report |
@@ -104,8 +105,8 @@ Public flags: `--client-id`, `--client-secret`, `--token-file`,
 
 ## 5. Verification history (as of 2026-10-27)
 
-- Layer 1+2: **43 tests, all passing** (20 lib incl. 4 known_hosts + 3
-  gui_settings; 23 integration incl. the untrust CLI test); fmt + clippy
+- Layer 1+2: **46 tests, all passing** (23 lib incl. known_hosts/gui_settings
+  + 3 ssh_config; 23 integration incl. the untrust CLI test); fmt + clippy
   `-D warnings` clean **with and without** `--features gui`.
 - Layer 3 e2e: **7/7** (command round trip, 50 MiB sha256, `ssh -L`, idle
   keepalive, **3.5 trust** — keyscan-independent probe matches the real sshd
@@ -172,6 +173,18 @@ Public flags: `--client-id`, `--client-secret`, `--token-file`,
    because PATH may not resolve `cfssh-proxy` from ssh's ProxyCommand shell.
 7. WS-TLS handshake against the REAL edge requires `wss://` (never ship
    `--insecure-ws` to users; it's hidden and test-only).
+8. **Trimming eframe's default features (`default-features = false`) kills
+   text rendering entirely** — `default_fonts` is one of eframe's defaults,
+   and egui then boots with zero font bytes: panels/buttons (vector fills)
+   render but no glyph ever does, on every renderer backend. That produced
+   the "window opens, nothing usable" bug on 2026-10-27. Ship eframe with
+   `features = ["default_fonts", ...]`.
+9. **WSLg's Wayland windowing reports a giant surface (8192×8192 RAIL) to
+   winit**, so egui mis-scales its layout (glyph slivers at window edges).
+   Forcing X11 (`WAYLAND_DISPLAY` unset + `libxkbcommon-x11` +
+   `libxcb-xkb.so.1` via `LD_LIBRARY_PATH=/tmp/opencode/xkb/ext/...` +
+   `WINIT_X11_SCALE_FACTOR=1`) fixes geometry on this box. Native Windows is
+   unaffected.
 
 ## 8. Open follow-ups
 
