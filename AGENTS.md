@@ -36,7 +36,12 @@ ssh / IntelliJ <-> cfssh-proxy <-> wss://ssh.ppcoder.xyz <-> cloudflared (server
 | `src/config.rs` | Credential resolution (optional!), file parsing/perms, `normalize_target` (bare host → `wss://`) |
 | `src/error.rs` | `Secret` redaction type, error texts, exit codes (cred errors = 2, others = 1) |
 | `src/tunnel.rs` | Hoisted connect plumbing shared by connect/listen/trust: `connect_ws`, `map_connect_error` (status→error), `serve_conn` (TCP→WS bridge) |
-| `src/subcommands.rs` | `untrust`/`trust` implementation: endpoint parsing (`host:port` tokens, `-p` duality), one-shot accept loop + `ssh-keyscan`, pin and print fingerprints |
+| `src/engine.rs` | The forwarder engine (`ForwarderConfig`, `ForwarderEvent`, `run_forwarder`, `spawn_forwarder`): one listener → per-connection WS bridges; shutdown via a watch channel. Shared by `--listen`, the GUI, anything future |
+| `src/gui_settings.rs` | Persisted user settings (Windows: `%APPDATA%\cfssh-proxy\config.toml`): target/token/bind/keepalive/LAN flag; half-token saves sanitized to anonymous |
+| `src/probe.rs` | Pure-Rust SSH2 host-key probe (russh): completes KEX, captures every offered host key, aborts before userauth — no ssh-keyscan dependency |
+| `src/gui/main.rs` | eframe GUI (Windows-first, compiles everywhere): connect panel, status, IDE endpoint hint, logs (tracing ring via writer), host-keys tab, tray hooks; no console in release (`windows_subsystem`) |
+| `src/gui/tray.rs` | Windows tray (state-colored icons, connect/disconnect/quit menu) behind `cfg(windows)`; inert stub on other platforms |
+| `src/subcommands.rs` | `untrust`/`trust` implementation + pub `learn_and_pin(TrustRequest)->TrustOutcome` shared with the GUI: endpoint parsing (`host:port` tokens, `-p` duality), one-shot accept loop + probe, pin + report |
 | `src/known_hosts.rs` | Pin manager: `HostPort` (`candidates`/`pin_host`), `remove_entries` (plain+`[h]:p`+hashed `|1|…` via ring HMAC-SHA1), `append_entries`, `fingerprint`; atomic write 0600 |
 | `tests/support/mock_edge.rs` | Hand-rolled RFC 6455 fake Cloudflare edge (401/403/302/502/echo/tcp-bridge/fragment/close-after-n/silent modes; `require_auth` flag) |
 | `tests/integration.rs` | Layer-2 suite spawning the real binary as a subprocess |
@@ -50,10 +55,12 @@ ssh / IntelliJ <-> cfssh-proxy <-> wss://ssh.ppcoder.xyz <-> cloudflared (server
 
 ```bash
 cargo fmt && cargo clippy --all-targets -- -D warnings   # both must stay clean
-cargo test                 # layers 1+2: 17 unit + 23 integration, ~2.5 s
-./scripts/e2e.sh           # layer 3 (Linux; needs openssh-server + ssh-keyscan)
+cargo clippy --features gui --all-targets -- -D warnings # ... and with the GUI feature
+cargo test                 # layers 1+2: 20 lib + 23 integration, ~2.5 s
+./scripts/e2e.sh           # layer 3 (Linux; needs openssh-server; keyscan NOT needed)
 ./scripts/live-test.sh     # optional; CF_ACCESS_* NOT required (anonymous ok)
-cargo build --release      # ~2.3 MiB stripped binary
+cargo build --release                       # CLI: ~2.3 MiB stripped binary
+cargo build --release --features gui        # + GUI: target/release/cfssh-gui(.exe)
 ```
 
 Subcommands (general-purpose host-key recovery, dispatched in `main()` before
@@ -97,23 +104,23 @@ Public flags: `--client-id`, `--client-secret`, `--token-file`,
 
 ## 5. Verification history (as of 2026-10-27)
 
-- Layer 1+2: **40 tests, all passing** (17 unit incl. 4 known_hosts; 23
-  integration incl. `untrust_cli_clears_old_pins_for_any_container`);
-  fmt + clippy `-D warnings` clean.
+- Layer 1+2: **43 tests, all passing** (20 lib incl. 4 known_hosts + 3
+  gui_settings; 23 integration incl. the untrust CLI test); fmt + clippy
+  `-D warnings` clean **with and without** `--features gui`.
 - Layer 3 e2e: **7/7** (command round trip, 50 MiB sha256, `ssh -L`, idle
-  keepalive, **3.5 trust** — keyscan through the tunnel matches the real sshd
-  host key, **3.6 untrust** — pins removed others untouched, kill-edge
+  keepalive, **3.5 trust** — keyscan-independent probe matches the real sshd
+  key, **3.6 untrust** — pins removed others untouched, kill-edge
   mid-session).
-- Release build verified and reinstalled; musl static build NOT built locally
-  (needs `x86_64-linux-musl-gcc`); Windows/macOS jobs untested (Linux-only so
-  far).
 - Live: anonymous connect to the real tunnel returns the container's
   `SSH-2.0-OpenSSH_9.6p1` banner.
-- Live `trust` on the real tunnel:
-  `~/.local/bin/cfssh-proxy trust ssh.ppcoder.xyz --client-host 127.0.0.1
-  --client-port 22022` pinned 3 keys (ecdsa+rsa+ed25519) for
-  `[127.0.0.1]:22022`, replacing the 1 old pin; rc=0. ed25519 fingerprint
-  matches the container's key: `SHA256:AeOtwbdDQ0xHNAu1ZIfHPLl/mrNsUxFrufNc00QXc34`.
+- Live `trust` on the real tunnel (probe-based, post-Phase-2): pinned the
+  same 3 keys (ecdsa+rsa+ed25519) with fingerprints identical to the earlier
+  ssh-keyscan run; rc=0. ed25519: `SHA256:AeOtwbdDQ0xHNAu1ZIfHPLl/mrNsUxFrufNc00QXc34`.
+- GUI: compiles clean (cargo check + clippy `--features gui`) on Linux and
+  the app logic is reviewed, but it has NOT yet been run interactively — the
+  first real run happens on a Windows laptop (tray behavior + HiDPI are the
+  watch items). The `.exe` ships from the windows-gui CI job once the
+  GitHub push lands.
 
 ## 6. State on THIS machine (important for ops-style tasks)
 
@@ -168,8 +175,15 @@ Public flags: `--client-id`, `--client-secret`, `--token-file`,
 
 ## 8. Open follow-ups
 
-- Complete the GitHub push (auth pending; see §6: `git push -u origin main`,
-  user chose to push manually — no gh CLI, no stored creds).
+- Complete the GitHub push (`git push -u origin main`) — it triggers the
+  first-ever CI run, incl. the **windows-gui job that produces
+  `cfssh-gui-portable.zip`**. User chose to push manually (no gh CLI, no
+  stored creds).
+- First GUI run on a real Windows machine: confirm tray icon/menu, no
+  console flash, connection flow end-to-end (engine code path identical to
+  the tested CLI, but the window/tray layer is unverified until then).
+- macOS/Linux GUI builds work via `--features gui` (tray stub) if the user
+  wants them — untested so far.
 - Consider key-only SSH login (README §2) / change the default password
   (`changeme` after the container was recreated on 2026-10-27).
 - CI on macOS/Windows and cross-compiled release binaries are defined but

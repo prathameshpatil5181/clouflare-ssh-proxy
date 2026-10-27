@@ -116,11 +116,21 @@ Both subcommands are fully generic — any tunnel target, host, or port.
 
 ## 3. Installing cfssh-proxy (laptop)
 
-Grab a release binary for your platform (Linux x86_64/aarch64, macOS
-x86_64/aarch64, Windows x86_64), or build it:
+Windows users: download **`cfssh-gui-portable.zip`** from the GitHub
+releases/actions artifacts — it contains the desktop app (`cfssh-gui.exe`)
+and the CLI (`cfssh-proxy.exe`). Unzip anywhere user-writable such as
+`%LOCALAPPDATA%\cfssh-proxy` (no admin rights, no installer, no UAC), run
+`cfssh-gui.exe`, type your tunnel host, click **Connect**, and point
+IntelliJ/ssh at the shown `host:port` (default `127.0.0.1:22022`).
+**Learn host key** (the ⟳ button) pins the sshd fingerprint through the
+tunnel; run it again whenever the container/server is recreated.
+
+CLI users on all platforms: grab a release binary for your platform
+(Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64), or build it:
 
 ```bash
 cargo build --release        # binary in target/release/cfssh-proxy
+cargo build --release --features gui   # + the GUI app (cfssh-gui)
 ```
 
 Put the binary on your `PATH` (e.g. `~/.local/bin/cfssh-proxy`).
