@@ -31,7 +31,22 @@ fn main() -> eframe::Result {
     cfp::install_crypto_provider();
     init_log_ring();
 
+    // Renderer selection: WSLg's EGL/GL path can lose the font texture
+    // (layout renders, glyphs don't). wgpu (Vulkan — lavapipe on WSLg) works
+    // there; on real Windows both work. CFSSH_RENDERER=wgpu|glow overrides.
+    let renderer = match std::env::var("CFSSH_RENDERER").as_deref() {
+        Ok("wgpu") => eframe::Renderer::Wgpu,
+        Ok("glow") => eframe::Renderer::Glow,
+        _ => if std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::env::var_os("WSLENV").is_some()
+        {
+            eframe::Renderer::Wgpu // WSLg fallback
+        } else {
+            eframe::Renderer::Glow // native Windows default
+        },
+    };
     let options = eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([580.0, 460.0])
             .with_min_inner_size([480.0, 380.0])
@@ -47,7 +62,21 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "cfssh-proxy",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(settings)))),
+        Box::new(move |cc| {
+            if let Ok(v) = std::env::var("CFSSH_PPP") {
+                if let Ok(f) = v.parse::<f32>() {
+                    cc.egui_ctx.set_pixels_per_point(f);
+                }
+            }
+            let fonts = egui::FontDefinitions::default();
+            println!(
+                "fonts: {} families, {} fonts, {} bytes loaded",
+                fonts.families.len(),
+                fonts.font_data.len(),
+                fonts.font_data.values().map(|d| d.font.len()).sum::<usize>(),
+            );
+            Ok(Box::new(App::new(settings)))
+        }),
     )
 }
 
