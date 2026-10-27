@@ -6,7 +6,7 @@ description = "OpenSSH ProxyCommand helper: bridges SSH over a Cloudflare Tunnel
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "process"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 # ring is selected explicitly and installed in main() so TLS never fails with
 # "could not automatically determine the process-level CryptoProvider".
@@ -19,6 +19,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
+# known_hosts handling (untrust/trust): plain + `|1|hash|salt` entries (ring HMAC-SHA1)
+base64 = "0.22"
+ring = "0.17.14"
 
 [profile.release]
 opt-level = "z"

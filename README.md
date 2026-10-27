@@ -77,6 +77,24 @@ Requirements for a JetBrains-friendly dev container:
 See `examples/Dockerfile` + `examples/docker-compose.yml` for a working
 starting point. Sanity check on the server: `ssh -p 2222 dev@localhost`.
 
+### When the container is recreated (SSH host key changed) — one-line recovery
+
+```bash
+# Re-learn the CURRENT key through the tunnel and pin it (prints fingerprints):
+cfssh-proxy trust ssh.ppcoder.xyz                                          # direct (client port 22)
+cfssh-proxy trust ssh.ppcoder.xyz --client-host 127.0.0.1 --client-port 22022
+                                                                           # via a --listen forwarder
+
+# Only clear stale pins, without re-learning:
+cfssh-proxy untrust ssh.ppcoder.xyz 127.0.0.1:22022
+```
+
+`trust` is Trust-On-First-Use with a fingerprint display: it runs the
+ephemeral local tunnel bridge itself, scans the key with `ssh-keyscan`,
+shows the `SHA256:…` fingerprint, and replaces the old pin. If the tunnel or
+origin sshd is down, it fails with a clear error instead of pinning nothing.
+Both subcommands are fully generic — any tunnel target, host, or port.
+
 ### Later: switch to key-only SSH login
 
 1. On the laptop: `ssh-keygen -t ed25519`.

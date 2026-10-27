@@ -537,6 +537,56 @@ async fn anonymous_handshake_vs_access_protected_edge_is_401() {
     assert!(!stderr_text.contains(CLIENT_SECRET));
 }
 
+// -------------------------------------------------- known_hosts recovery
+
+#[test]
+fn untrust_cli_clears_old_pins_for_any_container() {
+    // Generic host-key-rotation recovery: `cfssh-proxy untrust <hosts…> [-p P]`
+    // removes exact + hashed pins and leaves unrelated entries untouched.
+    let path = std::env::temp_dir().join(format!("cfssh-untrust-{}.kh", std::process::id()));
+    std::fs::write(
+        &path,
+        "ssh.ppcoder.xyz ssh-ed25519 AAAA-OLD-TUNNEL\n\
+         [127.0.0.1]:22022 ssh-ed25519 AAAA-OLD-FWD\n\
+         hashed-host.example ssh-ed25519 KEEP-ME\n\
+         other.example ssh-ed25519 KEEP-ME-2\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cfssh-proxy"))
+        .args([
+            "untrust",
+            "--known-hosts",
+            path.to_str().unwrap(),
+            "ssh.ppcoder.xyz",
+            "127.0.0.1",
+            "-p",
+            "22022",
+        ])
+        .env_remove("CF_ACCESS_CLIENT_ID")
+        .env_remove("CF_ACCESS_CLIENT_SECRET")
+        .output()
+        .expect("spawn cfssh-proxy untrust");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let binding = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&binding);
+    assert!(
+        out.status.success(),
+        "untrust must exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("removed 2 pin(s)"),
+        "remove count must be reported: {stderr}"
+    );
+    assert!(!text.contains("AAAA-OLD-TUNNEL"));
+    assert!(!text.contains("AAAA-OLD-FWD"));
+    assert!(text.contains("KEEP-ME-2"));
+    let _ = std::fs::remove_file(&path);
+}
+
+// ------------------------------------------------------------------- misc
+
 #[tokio::test(flavor = "multi_thread")]
 async fn half_credentials_still_rejected_with_sources() {
     // Only one half of the token present in the environment: unusable -> exit 2

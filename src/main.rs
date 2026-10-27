@@ -1,20 +1,17 @@
 mod bridge;
 mod config;
 mod error;
+mod known_hosts;
+mod subcommands;
+mod tunnel;
 
 use std::io::Write as _;
 use std::time::Duration;
 use std::time::Instant;
 
 use clap::Parser;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
-
 use config::{CliCredentials, EnvSource};
 use error::Error;
-
-const CF_ID_HEADER: HeaderName = HeaderName::from_static("cf-access-client-id");
-const CF_SECRET_HEADER: HeaderName = HeaderName::from_static("cf-access-client-secret");
 
 /// OpenSSH ProxyCommand helper: bridges local SSH (stdin/stdout) to an SSH
 /// endpoint published through a Cloudflare Tunnel (WebSocket), authenticating
@@ -87,19 +84,42 @@ fn install_crypto_provider() {
 }
 
 fn main() -> std::process::ExitCode {
-    let args = Args::parse();
+    let argv: Vec<String> = std::env::args().collect();
     install_crypto_provider();
-    init_tracing(args.verbose);
 
-    let code = match run(&args) {
+    let code = match argv.get(1).map(String::as_str) {
+        Some("untrust") => {
+            let a = subcommands::UntrustArgs::parse_from(
+                std::iter::once("cfssh-proxy".to_string()).chain(argv.into_iter().skip(2)),
+            );
+            let r = subcommands::run_untrust(&a);
+            finish(r)
+        }
+        Some("trust") => {
+            let a = subcommands::TrustArgs::parse_from(
+                std::iter::once("cfssh-proxy".to_string()).chain(argv.into_iter().skip(2)),
+            );
+            let r = subcommands::run_trust(&a);
+            finish(r)
+        }
+        _ => {
+            let args = Args::parse();
+            init_tracing(args.verbose);
+            finish(run(&args))
+        }
+    };
+    std::process::ExitCode::from(code as u8)
+}
+
+fn finish(result: Result<(), Error>) -> i32 {
+    match result {
         Ok(()) => 0,
         Err(e) => {
             // One clear error line to stderr; never the secret.
             let _ = writeln!(std::io::stderr(), "cfssh-proxy: error: {e}");
             e.exit_code()
         }
-    };
-    std::process::ExitCode::from(code as u8)
+    }
 }
 
 fn run(args: &Args) -> Result<(), Error> {
@@ -155,91 +175,12 @@ fn run(args: &Args) -> Result<(), Error> {
     Ok(())
 }
 
-async fn connect_ws(
-    url: &str,
-    creds: Option<&config::Credentials>,
-) -> Result<bridge::WsStream, Error> {
-    let mut request = url
-        .into_client_request()
-        .map_err(|e| Error::BadTarget(format!("{url}: {e}")))?;
-
-    // Cloudflare Access service token headers, only when configured. Tunnels
-    // published without an Access application accept the upgrade as-is.
-    if let Some(creds) = creds {
-        let headers = request.headers_mut();
-        headers.insert(
-            CF_ID_HEADER,
-            HeaderValue::from_str(&creds.client_id)
-                .map_err(|e| Error::WsSetup(format!("invalid client id: {e}")))?,
-        );
-        headers.insert(
-            CF_SECRET_HEADER,
-            HeaderValue::from_str(creds.client_secret.expose())
-                .map_err(|e| Error::WsSetup(format!("invalid client secret: {e}")))?,
-        );
-    }
-
-    tracing::debug!("connecting to the tunnel (WebSocket upgrade)…");
-    let (ws, response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| map_connect_error(e, creds.map(|c| c.client_id.as_str())))?;
-    tracing::debug!(status = ?response.status(), "tunnel established (HTTP 101)");
-    Ok(ws)
-}
-
-/// Map the many ways an upgrade can fail to one clear, actionable message.
-fn map_connect_error(e: tokio_tungstenite::tungstenite::Error, client_id: Option<&str>) -> Error {
-    use tokio_tungstenite::tungstenite::Error as WsError;
-    match e {
-        WsError::Http(response) => {
-            let status = response.status();
-            match status.as_u16() {
-                401 | 403 => match client_id {
-                    Some(id) => Error::AccessDeniedWithToken {
-                        status: status.as_u16(),
-                        client_id: id.to_string(),
-                    },
-                    None => Error::AccessDeniedNoToken {
-                        status: status.as_u16(),
-                    },
-                },
-                302 => {
-                    let location = response
-                        .headers()
-                        .get("location")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("(no Location header)")
-                        .to_string();
-                    Error::AccessRedirect { location }
-                }
-                502 => Error::OriginUnreachable {
-                    status: status.as_u16(),
-                },
-                other => Error::UnexpectedStatus(other),
-            }
-        }
-        WsError::Tls(tls_err) => Error::WsSetup(format!(
-            "TLS handshake failed: {tls_err}. Check the certificate chain and system trust roots."
-        )),
-        WsError::Io(io_err) => {
-            if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
-                Error::Io(format!("connection refused: {io_err}"))
-            } else {
-                Error::Io(format!(
-                    "{io_err} (network/DNS problem reaching the Cloudflare edge)"
-                ))
-            }
-        }
-        other => Error::Connect(format!("{other}")),
-    }
-}
-
 async fn run_bridge(
     url: &str,
     creds: Option<&config::Credentials>,
     keepalive: Duration,
 ) -> Result<(), Error> {
-    let ws = connect_ws(url, creds).await?;
+    let ws = tunnel::connect_ws(url, creds).await?;
     let stdin_rx = bridge::spawn_stdin_reader();
     bridge::run(ws, stdin_rx, keepalive).await
 }
@@ -281,7 +222,7 @@ async fn listen_mode(
                 let url_s = url.to_string();
                 let creds_c = creds.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_conn(sock, &url_s, creds_c, keepalive).await {
+                    if let Err(e) = tunnel::serve_conn(sock, &url_s, creds_c, keepalive).await {
                         let _ = writeln!(std::io::stderr(), "cfssh-proxy: connection error: {e}");
                     }
                 });
@@ -292,17 +233,4 @@ async fn listen_mode(
             }
         }
     }
-}
-
-async fn serve_conn(
-    sock: tokio::net::TcpStream,
-    url: &str,
-    creds: Option<config::Credentials>,
-    keepalive: Duration,
-) -> Result<(), Error> {
-    sock.set_nodelay(true).ok();
-    let ws = connect_ws(url, creds.as_ref()).await?;
-    let (read_half, write_half) = tokio::io::split(sock);
-    let input_rx = bridge::spawn_stream_reader(read_half).await;
-    bridge::run_duplex(ws, write_half, input_rx, keepalive).await
 }

@@ -214,7 +214,43 @@ else
     FAIL=$((FAIL+1))
 fi
 
-# 3.5 kill the mock edge mid-session; ssh must exit with a clear error
+# 3.5 trust: learn the sshd host key through the tunnel and pin it
+# (the exact flow for "my container was recreated"). Requires ssh-keyscan.
+if ! command -v ssh-keyscan >/dev/null 2>&1; then
+    record "SKIP 3.5 trust/untrust pin refresh (ssh-keyscan not installed)"
+else
+    KH="$TMPDIR_E2E/known_hosts_test"
+    : > "$KH"
+    EXPECT_FP=$(ssh-keygen -lf "$HOST_KEY.pub" | awk '{print $2}')
+    if timeout 60 "$BIN" trust --insecure-ws "127.0.0.1:$PORT" \
+        --client-host 127.0.0.1 --client-port "$SSHD_PORT" \
+        --known-hosts "$KH" > "$TMPDIR_E2E/logs/trust.log" 2>&1 &&
+        ssh-keygen -lf "$KH" | grep -q "$EXPECT_FP"; then
+        record "PASS 3.5 trust: key fetched via tunnel matches the real sshd key"
+        PASS=$((PASS+1))
+    else
+        record "FAIL 3.5 trust: pinned key does not match sshd"
+        FAIL=$((FAIL+1))
+        echo "--- trust.log:"; sed -n 1,25p "$TMPDIR_E2E/logs/trust.log"
+        echo "--- pinned:"; ssh-keygen -lf "$KH" 2>&1 | head -3
+        echo "--- expected:"; ssh-keygen -lf "$HOST_KEY.pub" 2>&1
+    fi
+
+    # untrust removes exactly those pins again
+    if "$BIN" untrust --known-hosts "$KH" "127.0.0.1:$SSHD_PORT" \
+        > "$TMPDIR_E2E/logs/untrust.log" 2>&1 &&
+        ! grep -qE '^(\[?127\.0\.0\.1|\|1\|) ' "$KH"; then
+        record "PASS 3.6 untrust: stale pins removed, others untouched"
+        PASS=$((PASS+1))
+    else
+        record "FAIL 3.6 untrust";
+        FAIL=$((FAIL+1))
+        echo "--- untrust.log:"; sed -n 1,10p "$TMPDIR_E2E/logs/untrust.log"
+        echo "--- file remaining:"; head -5 "$KH"
+    fi
+fi
+
+# 3.7 kill the mock edge mid-session; ssh must exit with a clear error
 run_ssh "sleep 8 && echo should-not-happen" 2>"$TMPDIR_E2E/logs/kill.err" &
 KP=$!
 PIDS+=("$KP")
@@ -224,10 +260,10 @@ sleep 25
 if kill -0 "$KP" 2>/dev/null; then
     kill -9 "$KP" 2>/dev/null
     wait "$KP" 2>/dev/null
-    record "FAIL 3.5 ssh hung after edge killed"; FAIL=$((FAIL+1))
+    record "FAIL 3.7 ssh hung after edge killed"; FAIL=$((FAIL+1))
 else
     wait "$KP" 2>/dev/null; rcs=$?
-    record "PASS 3.5 edge killed -> ssh exits promptly (rc=$rcs, message above)"
+    record "PASS 3.7 edge killed -> ssh exits promptly (rc=$rcs, message above)"
     PASS=$((PASS+1))
 fi
 
