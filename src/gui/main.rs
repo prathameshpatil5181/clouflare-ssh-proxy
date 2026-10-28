@@ -189,6 +189,8 @@ struct App {
     ssh_entry_error: Option<String>,
     /// why the last Connect attempt did not reach Connected (bind failure etc.)
     last_error: Option<String>,
+    /// when Disconnect was clicked; watchdog in case no Stopped event lands
+    stopping_since: Option<std::time::Instant>,
     tray: Option<tray::Tray>,
     quit: bool,
 }
@@ -212,6 +214,7 @@ impl App {
             ssh_entry_state: None,
             ssh_entry_error: None,
             last_error: None,
+            stopping_since: None,
             tray: tray::Tray::create(),
             quit: false,
             runtime,
@@ -287,6 +290,7 @@ impl App {
         }
         self.settings_error = None;
         self.last_error = None;
+        self.stopping_since = None;
         let url = match cfp::config::normalize_target(&self.settings.target, false) {
             Ok(u) => u,
             Err(e) => {
@@ -313,13 +317,17 @@ impl App {
     }
 
     fn disconnect(&mut self) {
-        match self.engine.take() {
-            Some(handle) => {
-                self.status = Status::Stopping;
-                // Fire shutdown; remaining events are drained during stopping.
+        // Keep the handle: the Stopped event must still be drained before the
+        // UI can leave `Stopping`. (Taking it orphaned the event channel and
+        // left the banner on "Disconnecting…" forever.)
+        if self.engine.is_some() {
+            self.status = Status::Stopping;
+            self.stopping_since = Some(std::time::Instant::now());
+            if let Some(handle) = self.engine.as_ref() {
                 let _ = handle.shutdown.send(true);
             }
-            None => self.status = Status::Disconnected,
+        } else {
+            self.status = Status::Disconnected;
         }
         if let Some(t) = self.tray.as_mut() {
             t.set_connected(false);
@@ -423,6 +431,16 @@ impl App {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        // Watchdog: Disconnect should never take more than a moment; if the
+        // Stopped event somehow never arrives, stop waiting on it.
+        if let Some(t0) = self.stopping_since {
+            if t0.elapsed() > Duration::from_secs(5) {
+                self.engine = None;
+                self.status = Status::Disconnected;
+                self.stopping_since = None;
+                tracing::warn!("disconnect watchdog: no Stopped event within 5s; recovered");
+            }
+        }
         // Forwarder events.
         if let Some(handle) = self.engine.as_mut() {
             while let Ok(ev) = handle.events.try_recv() {
@@ -445,6 +463,7 @@ impl App {
                         }
                         self.engine = None;
                         self.status = Status::Disconnected;
+                        self.stopping_since = None;
                         if let Some(t) = self.tray.as_mut() {
                             t.set_connected(false);
                         }
