@@ -670,19 +670,25 @@ impl App {
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
                 ui.label("Tunnel host / URL");
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut self.settings.target)
                         .hint_text("ssh.example.com   (your Cloudflare tunnel)")
                         .desired_width(320.0),
                 );
+                if r.changed() {
+                    self.settings.save().ok();
+                }
                 ui.end_row();
 
                 ui.label("Access client id");
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut self.settings.client_id)
                         .hint_text("optional — leave empty for anonymous tunnels")
                         .desired_width(320.0),
                 );
+                if r.changed() {
+                    self.settings.save().ok();
+                }
                 ui.end_row();
 
                 ui.label("Access client secret");
@@ -690,29 +696,41 @@ impl App {
                     .password(true)
                     .hint_text("optional")
                     .desired_width(320.0);
-                ui.add(secret);
+                let r = ui.add(secret);
+                if r.changed() {
+                    self.settings.save().ok();
+                }
                 ui.end_row();
 
                 ui.label("Forwarder port");
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut self.settings.bind)
                         .hint_text("22022")
                         .desired_width(120.0),
                 );
+                if r.changed() {
+                    self.settings.save().ok();
+                }
                 ui.horizontal(|ui| {
-                    ui.checkbox(
+                    let r = ui.checkbox(
                         &mut self.settings.lan_reachable,
                         "reachable from LAN (Windows may ask about the firewall once)",
                     );
+                    if r.changed() {
+                        self.settings.save().ok();
+                    }
                 });
                 ui.end_row();
 
                 ui.label("SSH user");
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut self.settings.ssh_user)
                         .hint_text("dev")
                         .desired_width(120.0),
                 );
+                if r.changed() {
+                    self.settings.save().ok();
+                }
                 ui.end_row();
             });
 
