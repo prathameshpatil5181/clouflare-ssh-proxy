@@ -136,15 +136,26 @@ fn init_log_ring() {
     // Store the global ring in a OnceCell-ish holder: the App reads it through
     // the same Arc by creating it first and passing it down.
     LOG.with(|cell| *cell.borrow_mut() = Some(ring.clone()));
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Third-party render spam (wgpu's "Device::maintain: waiting for
+    // submission index N" fires hundreds of times per SECOND at INFO while
+    // the GUI paints) drowned the app's own lines out of the 1000-line ring
+    // and made the Logs tab scroll forever. Clamp those crates to warning;
+    // CFSSH_LOUD=1 (or RUST_LOG=trace) opts a developer back into the firehose.
+    let default_filter = "info,wgpu_core=error,wgpu_hal=error,naga=error,winit=warn,eframe=warn";
+    let filter = if std::env::var("CFSSH_LOUD").as_deref() == Ok("1") {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"))
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter))
+    };
     // Ring for the Logs tab AND stderr (visible when launched from a
     // terminal or via our launcher logs) — tunnel failures must never be
-    // invisible.
+    // invisible. Timestamps on (UTC, ISO); ANSI off so gui.log stays plain.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(LogSink(ring))
-        .without_time()
+        .with_ansi(false)
         .try_init();
 }
 
@@ -194,6 +205,8 @@ struct App {
     status: Status,
     logs: LogRing,
     log_tab: bool,
+    /// Logs tab: live substring filter (case-insensitive)
+    log_filter: String,
     trust: Option<TrustJob>,
     trust_result: Option<Result<TrustOutcome, String>>,
     known_entries: Vec<String>,
@@ -223,6 +236,7 @@ impl App {
             status: Status::default(),
             logs: take_log_ring(),
             log_tab: false,
+            log_filter: String::new(),
             trust: None,
             trust_result: None,
             known_entries: Vec::new(),
@@ -626,6 +640,31 @@ fn mono_small(ui: &mut egui::Ui, text: impl Into<String>) {
     );
 }
 
+/// Level-aware styling for one log line (plain logs, ANSI stripped).
+fn level_styled(line: &str) -> egui::RichText {
+    let rt = egui::RichText::new(line).monospace().size(11.0);
+    if line.contains(" ERROR ") {
+        rt.color(egui::Color32::from_rgb(0xE8, 0x60, 0x50))
+    } else if line.contains(" WARN ") {
+        rt.color(egui::Color32::from_rgb(0xE8, 0xB0, 0x30))
+    } else if line.contains(" DEBUG ") || line.contains(" TRACE ") {
+        rt.color(egui::Color32::from_rgb(0x90, 0x90, 0x90))
+    } else if line.contains("device connected") {
+        rt.color(egui::Color32::from_rgb(0x3C, 0xB0, 0x57))
+    } else {
+        rt.color(egui::Color32::from_rgb(0xC8, 0xC8, 0xC8))
+    }
+}
+
+fn count_matched(ring: &VecDeque<String>, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    ring.iter()
+        .filter(|l| l.to_lowercase().contains(needle))
+        .count()
+}
+
 fn rc_error_text(err: &str) -> String {
     // session-level notes are informational: one client connection ended
     if let Some(rest) = err.strip_prefix("session failed: ") {
@@ -997,18 +1036,47 @@ impl App {
         });
     }
 
+    /// Logs tab: color-coded, filterable, stable — no third-party spam.
     fn logs_ui(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Clear").clicked() {
-            self.logs.lock().unwrap().clear();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Clear").clicked() {
+                self.logs.lock().unwrap().clear();
+            }
+            ui.separator();
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.log_filter)
+                    .hint_text("filter lines (substring)")
+                    .desired_width(160.0),
+            );
+            if r.changed() {
+                ui.ctx().request_repaint();
+            }
+            ui.weak("UTC timestamps · CFSSH_LOUD=1 for full wire detail");
+        });
         ui.separator();
+        let needle = self.log_filter.trim().to_lowercase();
+        let ring = self.logs.lock().unwrap().clone();
         egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                let ring = self.logs.lock().unwrap().clone();
+                let mut shown = 0usize;
                 for line in &ring {
-                    ui.monospace(line);
+                    if !needle.is_empty() && !line.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    shown += 1;
+                    ui.add(egui::Label::new(level_styled(line)).wrap());
+                }
+                if shown == 0 && !needle.is_empty() {
+                    ui.weak(format!("no lines match “{}”", self.log_filter.trim()));
                 }
             });
+        ui.separator();
+        ui.small(format!(
+            "{matched} of {total} lines",
+            matched = count_matched(&ring, &needle),
+            total = ring.len()
+        ));
     }
 }
