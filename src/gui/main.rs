@@ -523,13 +523,20 @@ impl App {
 
 /// Human phrasing for the common forwarder startup failures.
 fn rc_error_text(err: &str) -> String {
-    if err.contains("cannot listen on")
+    // session-level notes are informational: one client connection ended
+    if let Some(rest) = err.strip_prefix("session failed: ") {
+        format!(
+            "a client connection dropped: {rest}\n\
+             (usually a client or IDE reachability probe closing abruptly — \
+             the forwarder stays up; retry the connection)"
+        )
+    } else if err.contains("cannot listen on")
         && (err.contains("already in use")
             || err.contains("os error 98")
             || err.contains("os error 10048"))
     {
         format!(
-            "{err}\nThe port is taken — usually a second app instance (now              prevented) or an old `cfssh-proxy --listen` still running."
+            "{err}\nThe port is taken — usually a second app instance (now prevented) or an old `cfssh-proxy --listen` still running."
         )
     } else {
         format!("could not start the forwarder: {err}")
@@ -743,10 +750,19 @@ impl App {
             egui::RichText::new(text).strong().size(15.0).color(color),
         ));
         if let Some(err) = &self.last_error {
-            ui.colored_label(
-                egui::Color32::from_rgb(0xE8, 0x60, 0x50),
-                rc_error_text(err),
-            );
+            let (color, text) = if err.starts_with("session failed: ") {
+                // informational: one connection died, the forwarder is fine
+                (
+                    egui::Color32::from_rgb(0xE8, 0xB0, 0x30),
+                    rc_error_text(err),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgb(0xE8, 0x60, 0x50),
+                    rc_error_text(err),
+                )
+            };
+            ui.colored_label(color, text);
         }
         ui.add_space(6.0);
 

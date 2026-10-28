@@ -246,8 +246,15 @@ where
         match next {
             Some(Ok(Message::Binary(data))) => {
                 // The client sink is sacred: write the payload immediately and flush.
-                sink_to_client.write_all(&data).await?;
-                sink_to_client.flush().await?;
+                // During drain the client is already gone — a failed write is
+                // routine, not a session error.
+                if draining {
+                    let _ = sink_to_client.write_all(&data).await;
+                    let _ = sink_to_client.flush().await;
+                } else {
+                    sink_to_client.write_all(&data).await?;
+                    sink_to_client.flush().await?;
+                }
             }
             // Pings are answered with Pongs automatically by tungstenite on the
             // next sink write/flush; Pongs from our own keepalives are ignored.
@@ -260,14 +267,12 @@ where
             Some(Ok(_)) => {} // Text frames carry no meaning for a TCP tunnel
             Some(Err(e)) => {
                 let _ = server_closed_tx.send(());
-                if draining
-                    && matches!(
-                        e,
-                        tokio_tungstenite::tungstenite::Error::ConnectionClosed
-                            | tokio_tungstenite::tungstenite::Error::AlreadyClosed
-                    )
-                {
-                    // read errors during the close dance are expected
+                if draining {
+                    // Our client is already gone; the close dance frequently
+                    // ends in a TCP RST instead of a WS close frame
+                    // ("Connection reset without closing handshake" et al.).
+                    // Routine and undeliverable: treat as end-of-drain.
+                    tracing::debug!(error = %e, "drain ended with error (benign: client gone)");
                     return Ok(());
                 }
                 return Err(ws_err(e));
