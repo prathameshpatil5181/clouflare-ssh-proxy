@@ -45,15 +45,54 @@ impl ForwarderConfig {
     }
 }
 
+/// Live per-session counters, shared between the bridge task and the UI (the
+/// engine hands the same handle through the event channel).
+#[derive(Debug)]
+pub struct SessionStats {
+    /// Bytes tunneled client → server (what the client sent).
+    pub up: std::sync::atomic::AtomicU64,
+    /// Bytes tunneled server → client (what the client received).
+    pub down: std::sync::atomic::AtomicU64,
+    /// Roughly "is it alive": monotonic traffic markers, touched on every
+    /// message so a UI can show a heartbeat instead of raw bytes.
+    pub activity: std::sync::atomic::AtomicBool,
+}
+
+impl SessionStats {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            up: std::sync::atomic::AtomicU64::new(0),
+            down: std::sync::atomic::AtomicU64::new(0),
+            activity: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    pub fn note_up(&self, n: u64) {
+        self.up.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.activity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn note_down(&self, n: u64) {
+        self.down.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.activity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Everything the UI needs to know, in order.
 #[derive(Debug, Clone)]
 pub enum ForwarderEvent {
     /// Listener bound and accepting.
     Listening { addr: SocketAddr },
-    /// A client TCP connection was accepted (session started).
-    Accepted,
+    /// A client TCP connection was accepted (session started). `id` is
+    /// unique within one forwarder lifetime; `stats` is the live counter
+    /// handle for this session.
+    Accepted {
+        id: u64,
+        addr: SocketAddr,
+        stats: std::sync::Arc<SessionStats>,
+    },
     /// One bridged session ended (client or tunnel side closed).
-    SessionEnded { error: Option<String> },
+    SessionEnded { id: u64, error: Option<String> },
     /// The forwarder itself stopped (shutdown triggered, or error).
     Stopped { error: Option<String> },
 }
@@ -99,10 +138,11 @@ pub async fn run_forwarder(
         .map_err(|e| Error::WsSetup(format!("listener has no address: {e}")))?;
     let _ = events.send(ForwarderEvent::Listening { addr });
 
+    let mut next_id: u64 = 0;
     loop {
         let sock = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((s, _)) => s,
+                Ok((s, peer)) => (s, peer),
                 Err(e) => {
                     tracing::warn!(error = %e, "listen accept failed; continuing");
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -111,18 +151,26 @@ pub async fn run_forwarder(
             },
             _ = shutdown.changed() => return Ok(()),
         };
-        let _ = events.send(ForwarderEvent::Accepted);
+        let (sock, peer) = sock;
+        next_id += 1;
+        let id = next_id;
+        let stats = SessionStats::new();
+        let _ = events.send(ForwarderEvent::Accepted {
+            id,
+            addr: peer,
+            stats: stats.clone(),
+        });
         let url = cfg.target.clone();
         let creds = cfg.credentials.clone();
         let keepalive = cfg.keepalive;
         let ev = events.clone();
         tokio::spawn(async move {
-            let result = tunnel::serve_conn(sock, &url, creds, keepalive).await;
+            let result = tunnel::serve_conn(sock, &url, creds, keepalive, Some(stats)).await;
             let error = result.as_ref().err().map(|e| e.to_string());
             if let Some(err_text) = &error {
                 tracing::debug!(error = %err_text, "session ended with error");
             }
-            let _ = ev.send(ForwarderEvent::SessionEnded { error });
+            let _ = ev.send(ForwarderEvent::SessionEnded { id, error });
         });
     }
 }

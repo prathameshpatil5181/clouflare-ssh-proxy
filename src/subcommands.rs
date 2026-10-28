@@ -292,7 +292,7 @@ pub async fn learn_and_pin(req: &TrustRequest) -> Result<TrustOutcome, Error> {
                             let u = url_s.clone();
                             let c = creds_c.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = serve_conn(sock, &u, c, ka).await {
+                                if let Err(e) = serve_conn(sock, &u, c, ka, None).await {
                                     tracing::debug!(%e, "scan bridge conn ended");
                                 }
                             });

@@ -110,7 +110,7 @@ pub async fn run(
     stdin_rx: Receiver<std::io::Result<Vec<u8>>>,
     keepalive: Duration,
 ) -> Result<(), Error> {
-    run_duplex(ws, tokio::io::stdout(), stdin_rx, keepalive).await
+    run_duplex(ws, tokio::io::stdout(), stdin_rx, keepalive, None).await
 }
 
 /// Listen-mode bridge: an arbitrary AsyncWrite target (e.g. one half of a
@@ -120,6 +120,7 @@ pub async fn run_duplex<W>(
     writer: W,
     stdin_rx: Receiver<std::io::Result<Vec<u8>>>,
     keepalive: Duration,
+    stats: Option<std::sync::Arc<crate::engine::SessionStats>>,
 ) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -134,8 +135,15 @@ where
         keepalive,
         stdin_closed_tx,
         server_closed_rx,
+        stats.clone(),
     ));
-    let receiver = tokio::spawn(recv_side(stream, writer, stdin_closed_rx, server_closed_tx));
+    let receiver = tokio::spawn(recv_side(
+        stream,
+        writer,
+        stdin_closed_rx,
+        server_closed_tx,
+        stats,
+    ));
 
     let send_res = sender
         .await
@@ -160,6 +168,7 @@ async fn send_side(
     keepalive: Duration,
     stdin_closed_tx: tokio::sync::oneshot::Sender<()>,
     mut server_closed_rx: tokio::sync::oneshot::Receiver<()>,
+    stats: Option<std::sync::Arc<crate::engine::SessionStats>>,
 ) -> Result<(), Error> {
     let mut interval = tokio::time::interval(keepalive);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -176,9 +185,13 @@ async fn send_side(
             chunk = stdin_rx.recv() => {
                 match chunk {
                     Some(Ok(data)) if !data.is_empty() => {
+                        let n = data.len();
                         if sink.send(Message::Binary(data)).await.is_err() {
                             let _ = stdin_closed_tx.send(());
                             return Ok(()); // receiver will surface its own error
+                        }
+                        if let Some(st) = stats.as_ref() {
+                            st.note_up(n as u64);
                         }
                     }
                     // Empty payload = stdin EOF (see spawn_stdin_reader).
@@ -216,6 +229,7 @@ async fn recv_side<W>(
     mut sink_to_client: W,
     mut stdin_closed_rx: tokio::sync::oneshot::Receiver<()>,
     server_closed_tx: tokio::sync::oneshot::Sender<()>,
+    stats: Option<std::sync::Arc<crate::engine::SessionStats>>,
 ) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -254,6 +268,9 @@ where
                 } else {
                     sink_to_client.write_all(&data).await?;
                     sink_to_client.flush().await?;
+                    if let Some(st) = stats.as_ref() {
+                        st.note_down(data.len() as u64);
+                    }
                 }
             }
             // Pings are answered with Pongs automatically by tungstenite on the

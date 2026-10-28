@@ -167,11 +167,13 @@ fn run(args: &Args) -> Result<(), Error> {
                                     addr.port()
                                 );
                             }
-                            ForwarderEvent::Accepted => {}
-                            ForwarderEvent::SessionEnded { error: Some(e) } => {
+                            ForwarderEvent::Accepted { id, addr, .. } => {
+                                let _ = writeln!(out, "cfssh-proxy: session #{id} from {addr}");
+                            }
+                            ForwarderEvent::SessionEnded { error: Some(e), .. } => {
                                 let _ = writeln!(out, "cfssh-proxy: connection error: {e}");
                             }
-                            ForwarderEvent::SessionEnded { error: None } => {}
+                            ForwarderEvent::SessionEnded { error: None, .. } => {}
                             ForwarderEvent::Stopped { error: Some(e) } => {
                                 let _ = writeln!(out, "cfssh-proxy: forwarder stopped: {e}");
                             }

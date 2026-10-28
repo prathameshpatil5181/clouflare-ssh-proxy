@@ -176,7 +176,15 @@ struct TrustJob {
 struct EngineHandle {
     events: tokio::sync::mpsc::UnboundedReceiver<ForwarderEvent>,
     shutdown: tokio::sync::watch::Sender<bool>,
-    sessions: usize,
+    /// live connections, one row each (the Devices table)
+    sessions: Vec<SessionRow>,
+}
+
+struct SessionRow {
+    id: u64,
+    peer: String,
+    started: std::time::Instant,
+    stats: std::sync::Arc<cfp::engine::SessionStats>,
 }
 
 struct App {
@@ -319,7 +327,7 @@ impl App {
         self.engine = Some(EngineHandle {
             events,
             shutdown,
-            sessions: 0,
+            sessions: Vec::new(),
         });
         self.status = Status::Disconnected; // until the Listening event lands
         tracing::info!("starting forwarder for {}", self.settings.target);
@@ -421,12 +429,12 @@ impl App {
         match (&self.status, self.engine.as_ref()) {
             (Status::Listening { addr }, Some(e)) => (
                 green,
-                if e.sessions > 0 {
+                if !e.sessions.is_empty() {
                     format!(
                         "Connected · {} · {} active session{}",
                         addr,
-                        e.sessions,
-                        if e.sessions == 1 { "" } else { "s" }
+                        e.sessions.len(),
+                        if e.sessions.len() == 1 { "" } else { "s" }
                     )
                 } else {
                     format!("Connected · {addr} (waiting for the first connection)")
@@ -461,17 +469,34 @@ impl App {
                             t.set_connected(true);
                         }
                     }
-                    ForwarderEvent::Accepted => handle.sessions += 1,
-                    ForwarderEvent::SessionEnded { error: Some(e) } => {
+                    ForwarderEvent::Accepted { id, addr, stats } => {
+                        let peer = addr.to_string();
+                        tracing::info!("device connected: session #{id} from {peer}");
+                        self.last_error = None;
+                        handle.sessions.push(SessionRow {
+                            id,
+                            peer,
+                            started: std::time::Instant::now(),
+                            stats,
+                        });
+                    }
+                    ForwarderEvent::SessionEnded { id, error: Some(e) } => {
                         // Session failures are the #1 invisible failure mode:
                         // the listener is green while every client connection
                         // dies inside the bridge (wrong host, closed sshd...).
-                        tracing::warn!("session failed: {e}");
-                        self.last_error = Some(format!("session failed: {e}"));
-                        handle.sessions = handle.sessions.saturating_sub(1);
+                        // Strip tungstenite boilerplate for readability.
+                        let short = e.replace(
+                            "connection error: WebSocket error: WebSocket protocol error: ",
+                            "",
+                        );
+                        tracing::warn!("session failed: {short}");
+                        self.last_error = Some(format!("session failed: {short}"));
+                        tracing::info!("device disconnected: session #{id}");
+                        handle.sessions.retain(|r| r.id != id);
                     }
-                    ForwarderEvent::SessionEnded { error: None } => {
-                        handle.sessions = handle.sessions.saturating_sub(1)
+                    ForwarderEvent::SessionEnded { id, error: None } => {
+                        tracing::info!("device disconnected: session #{id}");
+                        handle.sessions.retain(|r| r.id != id);
                     }
                     ForwarderEvent::Stopped { error } => {
                         if let Some(e) = error {
@@ -522,6 +547,39 @@ impl App {
 }
 
 /// Human phrasing for the common forwarder startup failures.
+fn human_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let n = n as f64;
+    if n >= MIB {
+        format!("{:.1} MiB", n / MIB)
+    } else if n >= KIB {
+        format!("{:.1} KiB", n / KIB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn human_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Small monospace cell (independent of egui convenience methods).
+fn mono_small(ui: &mut egui::Ui, text: impl Into<String>) {
+    let text: String = text.into();
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).small().monospace())
+            .wrap_mode(egui::TextWrapMode::Truncate),
+    );
+}
+
 fn rc_error_text(err: &str) -> String {
     // session-level notes are informational: one client connection ended
     if let Some(rest) = err.strip_prefix("session failed: ") {
@@ -841,6 +899,42 @@ impl App {
                 .clicked()
             {
                 self.untrust_now();
+            }
+        }
+
+        // ---- Devices: every live connection with live traffic ------------
+        if let Some(handle) = self.engine.as_ref() {
+            if !handle.sessions.is_empty() {
+                ui.add_space(8.0);
+                ui.heading(format!("Devices ({})", handle.sessions.len()));
+                egui::Grid::new("devices")
+                    .num_columns(5)
+                    .spacing([14.0, 3.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for h in ["#", "from", "connected", "↓ received", "↑ sent"] {
+                            ui.add(egui::Label::new(egui::RichText::new(h).small().strong()));
+                        }
+                        ui.end_row();
+                        for row in &handle.sessions {
+                            mono_small(ui, format!("#{}", row.id));
+                            mono_small(ui, &row.peer);
+                            mono_small(ui, human_duration(row.started.elapsed()));
+                            mono_small(
+                                ui,
+                                human_bytes(
+                                    row.stats.down.load(std::sync::atomic::Ordering::Relaxed),
+                                ),
+                            );
+                            mono_small(
+                                ui,
+                                human_bytes(
+                                    row.stats.up.load(std::sync::atomic::Ordering::Relaxed),
+                                ),
+                            );
+                            ui.end_row();
+                        }
+                    });
             }
         }
 

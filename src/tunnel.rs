@@ -96,10 +96,11 @@ pub async fn serve_conn(
     url: &str,
     creds: Option<config::Credentials>,
     keepalive: std::time::Duration,
+    stats: Option<std::sync::Arc<crate::engine::SessionStats>>,
 ) -> Result<(), Error> {
     sock.set_nodelay(true).ok();
     let ws = connect_ws(url, creds.as_ref()).await?;
     let (read_half, write_half) = tokio::io::split(sock);
     let input_rx = bridge::spawn_stream_reader(read_half).await;
-    bridge::run_duplex(ws, write_half, input_rx, keepalive).await
+    bridge::run_duplex(ws, write_half, input_rx, keepalive, stats).await
 }
