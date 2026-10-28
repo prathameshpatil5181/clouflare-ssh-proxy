@@ -171,6 +171,16 @@ mod tests {
 
     #[test]
     fn full_token_roundtrips_and_paths_cohere() {
+        // NEVER write to the real user profile from tests: today this test
+        // both overwrote and deleted the operator's live config.toml on
+        // every `cargo test` run. Redirect the whole settings path into a
+        // throwaway dir under the OS temp dir.
+        let tmp = std::env::temp_dir()
+            .join("cfssh-proxy-test")
+            .join(format!("cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::env::set_var("APPDATA", &tmp); // Windows CI path
         let mut s = GuiSettings {
             target: "ssh.ppcoder.xyz".into(),
             client_id: "id.access".into(),
@@ -179,7 +189,7 @@ mod tests {
             lan_reachable: true,
             ..GuiSettings::default()
         };
-        // Persist somewhere real (OS config dir exists on Linux test boxes).
+        // Persist, reload, and confirm the round-trip through the same env.
         s.save().expect("save");
         let loaded = GuiSettings::load().expect("load");
         assert_eq!(loaded.target, "ssh.ppcoder.xyz");
@@ -187,9 +197,10 @@ mod tests {
         assert_eq!(loaded.bind_addr(), "0.0.0.0:22022");
         assert_eq!(loaded.display_endpoint(), "0.0.0.0:22022");
         assert!(loaded.credentials().is_some());
-
-        // Cleanup so other tests see defaults.
-        std::fs::remove_file(GuiSettings::path().unwrap()).ok();
+        // Cleanup is confined to the throwaway dir.
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("APPDATA");
     }
 
     #[test]

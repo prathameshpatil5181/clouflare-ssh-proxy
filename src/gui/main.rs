@@ -315,6 +315,52 @@ impl App {
                 return;
             }
         };
+        // Preflight: resolve the tunnel host before the listener comes up.
+        // A NXDOMAIN host previously produced one amber note PER CLIENT
+        // connection while the banner stayed green; a typo must instead fail
+        // loudly, ONCE, right here, naming the field to check.
+        let host = url
+            .trim_start_matches("wss://")
+            .trim_start_matches("ws://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let lookup_host = host.clone();
+        std::thread::spawn(move || {
+            use std::net::ToSocketAddrs;
+            let res = (lookup_host.as_str(), 443u16)
+                .to_socket_addrs()
+                .map_err(|e| format!("'{lookup_host}' could not be resolved: {e}"))
+                .and_then(|addrs| {
+                    if addrs.count() > 0 {
+                        Ok(())
+                    } else {
+                        Err(format!("'{lookup_host}' resolved to no addresses"))
+                    }
+                });
+            let _ = tx.send(res);
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.settings_error = Some(format!(
+                    "{e}\nThe tunnel host looks like a typo — check the field \
+                     above (recent loads used ssh.ppcoder.xyz)."
+                ));
+                tracing::error!("connect rejected: {e}");
+                return;
+            }
+            Err(_) => {
+                self.settings_error = Some(format!(
+                    "'{host}' did not resolve within 5 s (network down?) — \
+                     check the field above."
+                ));
+                tracing::error!("connect rejected: {host} DNS timeout");
+                return;
+            }
+        }
         self.settings.save().ok(); // persist on every successful attempt
         let cfg = ForwarderConfig {
             target: url,
