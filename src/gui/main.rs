@@ -538,6 +538,13 @@ fn rc_error_text(err: &str) -> String {
         format!(
             "{err}\nThe port is taken — usually a second app instance (now prevented) or an old `cfssh-proxy --listen` still running."
         )
+    } else if err.contains("UnrecognisedName") {
+        format!(
+            "{err}\n\
+             The edge rejected the hostname during TLS — the tunnel host is \
+             most likely a typo. Check the field above against your real \
+             Cloudflare hostname."
+        )
     } else {
         format!("could not start the forwarder: {err}")
     }
