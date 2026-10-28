@@ -115,6 +115,8 @@ impl std::io::Write for LogSinkWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let text = String::from_utf8_lossy(buf).trim_end().to_string();
         if !text.is_empty() {
+            // Teed: the Logs tab ring, and stderr (captured by our launcher).
+            eprintln!("{text}");
             let mut ring = self.0.lock().unwrap();
             ring.push_back(text);
             while ring.len() > LOG_CAPACITY {
@@ -136,6 +138,9 @@ fn init_log_ring() {
     LOG.with(|cell| *cell.borrow_mut() = Some(ring.clone()));
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Ring for the Logs tab AND stderr (visible when launched from a
+    // terminal or via our launcher logs) — tunnel failures must never be
+    // invisible.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(LogSink(ring))
@@ -191,6 +196,9 @@ struct App {
     last_error: Option<String>,
     /// when Disconnect was clicked; watchdog in case no Stopped event lands
     stopping_since: Option<std::time::Instant>,
+    /// hidden CFSSH_AUTOSTART=1: fire Connect on the first frame (deep links,
+    /// launcher shortcuts, diagnostics)
+    auto_connect: bool,
     tray: Option<tray::Tray>,
     quit: bool,
 }
@@ -215,6 +223,7 @@ impl App {
             ssh_entry_error: None,
             last_error: None,
             stopping_since: None,
+            auto_connect: std::env::var("CFSSH_AUTOSTART").as_deref() == Ok("1"),
             tray: tray::Tray::create(),
             quit: false,
             runtime,
@@ -453,7 +462,15 @@ impl App {
                         }
                     }
                     ForwarderEvent::Accepted => handle.sessions += 1,
-                    ForwarderEvent::SessionEnded { .. } => {
+                    ForwarderEvent::SessionEnded { error: Some(e) } => {
+                        // Session failures are the #1 invisible failure mode:
+                        // the listener is green while every client connection
+                        // dies inside the bridge (wrong host, closed sshd...).
+                        tracing::warn!("session failed: {e}");
+                        self.last_error = Some(format!("session failed: {e}"));
+                        handle.sessions = handle.sessions.saturating_sub(1);
+                    }
+                    ForwarderEvent::SessionEnded { error: None } => {
                         handle.sessions = handle.sessions.saturating_sub(1)
                     }
                     ForwarderEvent::Stopped { error } => {
@@ -527,6 +544,10 @@ fn default_known_hosts() -> PathBuf {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.auto_connect {
+            self.auto_connect = false;
+            self.connect();
+        }
         // Poll tray actions regardless of the current UI state.
         if let Some(t) = self.tray.as_mut() {
             match t.poll(ctx) {
