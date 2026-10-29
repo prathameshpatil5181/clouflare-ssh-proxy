@@ -25,6 +25,7 @@ mod imp {
             None
         }
         pub fn set_connected(&mut self, _connected: bool) {}
+        pub fn set_origin_reachable(&mut self, _ok: bool) {}
         pub fn poll(&mut self, _ctx: &Context) -> Action {
             Action::None
         }
@@ -53,13 +54,18 @@ mod imp {
         connect_item: MenuItem,
         disconnect_item: MenuItem,
         green_icon: Icon,
+        amber_icon: Icon,
         gray_icon: Icon,
         connected: bool,
+        /// Whether the last origin probe verified the backend sshd. Only
+        /// meaningful while `connected`; false turns the icon amber.
+        origin_ok: bool,
     }
 
     impl Tray {
         pub fn create() -> Option<Self> {
             let green_icon = make_icon([90, 190, 90]);
+            let amber_icon = make_icon([232, 176, 48]);
             let gray_icon = make_icon([150, 150, 150]);
             let connect_item = MenuItem::with_id(ID_CONNECT, "Connect", true, None);
             let disconnect_item = MenuItem::with_id(ID_DISCONNECT, "Disconnect", false, None);
@@ -69,6 +75,7 @@ mod imp {
             let _ = menu.append(&disconnect_item);
             let _ = menu.append(&quit);
 
+            // Amber while `connected` means: the backend is dead.
             let tray = TrayIconBuilder::new()
                 .with_tooltip("cfssh-proxy — SSH over Cloudflare Tunnel")
                 .with_icon(gray_icon.clone())
@@ -82,8 +89,10 @@ mod imp {
                 connect_item,
                 disconnect_item,
                 green_icon,
+                amber_icon,
                 gray_icon,
                 connected: false,
+                origin_ok: true,
             })
         }
 
@@ -91,11 +100,23 @@ mod imp {
             self.connected = connected;
             self.connect_item.set_enabled(!connected);
             self.disconnect_item.set_enabled(connected);
-            let icon = (if connected {
+            self.refresh_icon();
+        }
+
+        /// The GUI's verdict on the backend sshd, from the engine's probes.
+        pub fn set_origin_reachable(&mut self, ok: bool) {
+            self.origin_ok = ok;
+            self.refresh_icon();
+        }
+
+        fn refresh_icon(&mut self) {
+            let icon = if !self.connected {
+                &self.gray_icon
+            } else if self.origin_ok {
                 &self.green_icon
             } else {
-                &self.gray_icon
-            })
+                &self.amber_icon
+            }
             .clone();
             // tray-icon 0.26 takes an Option (None = remove the icon).
             let _ = self.tray.set_icon(Some(icon));

@@ -466,6 +466,81 @@ async fn listen_mode_relays_tcp_connections() {
     let _ = child.wait();
 }
 
+/// Shared scaffolding for the origin-probe tests: run `--listen` against a
+/// mock edge and watch stderr lines until one of the probe verdicts shows up.
+/// Returns the verdict line and whether it was the healthy one. Kills the
+/// child before returning.
+async fn run_listen_and_await_probe_verdict(edge_mode: EdgeMode) -> (String, bool) {
+    let edge = support::mock_edge::start(edge_mode, edge_options()).await;
+    let mut cmd = base_command(
+        &["--insecure-ws", "--listen", "127.0.0.1:0"],
+        &format!("127.0.0.1:{}", edge.addr.port()),
+    );
+    with_correct_env(&mut cmd);
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+
+    use std::io::BufRead as _;
+    let mut reader = std::io::BufReader::new(&mut stderr);
+    // Budget: a failing probe waits BANNER_WAIT (5 s) from the first tick.
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let mut saw = String::new();
+    let mut healthy = false;
+    let mut line = String::new();
+    while std::time::Instant::now() < deadline {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        if line.contains("origin probe ok:") {
+            saw = line.trim().to_string();
+            healthy = true;
+            break;
+        }
+        if line.contains("origin UNREACHABLE:") {
+            saw = line.trim().to_string();
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    (saw, healthy)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_probe_proves_the_backend_alive() {
+    // sshd speaks first (greeting banner) -> the engine's own health probe
+    // must confirm the LAST hop is alive without any client session at all.
+    // This is the evidence the GUI banner's green state rests on.
+    let (verdict, healthy) = run_listen_and_await_probe_verdict(EdgeMode::Banner(
+        b"SSH-2.0-OpenSSH_9.6p1 cfssh-tests\r\n".to_vec(),
+    ))
+    .await;
+    assert!(healthy, "expected 'origin probe ok'; got: {verdict}");
+    assert!(
+        verdict.contains("SSH-2.0-OpenSSH_9.6p1"),
+        "probe detail should carry the origin banner; got: {verdict}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_probe_exposes_a_dead_backend() {
+    // The production signature (engine upgrade is 101, origin silent because
+    // sshd is down): Echo stays mute until spoken to, so the probe must wait
+    // out its banner window and report UNREACHABLE — the banner state the UI
+    // must show instead of a plain green "Connected".
+    let (verdict, healthy) = run_listen_and_await_probe_verdict(EdgeMode::Echo).await;
+    assert!(!healthy, "expected 'origin UNREACHABLE'; got: {verdict}");
+    assert!(
+        verdict.contains("no data from the origin") || verdict.contains("sshd"),
+        "unreachable detail should say what happened; got: {verdict}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn anonymous_connect_without_credentials_ok() {
     // Tunnels published without a Cloudflare Access application accept the

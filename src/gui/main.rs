@@ -178,6 +178,19 @@ enum Status {
     Stopping,
 }
 
+/// What the most recent evidence says about the ORIGIN behind the tunnel
+/// (the backend sshd) — independent of the listener/tunnel hops, which are
+/// green even when the backend is dead (production incident, 2026-10-29).
+#[derive(Debug, Clone)]
+enum OriginStatus {
+    /// No probe result yet (Connect was just pressed).
+    Checking,
+    /// The last probe (or live traffic) proved the origin answers.
+    Verified,
+    /// Asked repeatedly, the origin never speaks: backend sshd is dead.
+    Unreachable(String),
+}
+
 // Trust work runs on the shared tokio runtime; the UI polls this.
 struct TrustJob {
     rx: tokio::sync::mpsc::UnboundedReceiver<Result<TrustOutcome, String>>,
@@ -189,6 +202,8 @@ struct EngineHandle {
     shutdown: tokio::sync::watch::Sender<bool>,
     /// live connections, one row each (the Devices table)
     sessions: Vec<SessionRow>,
+    /// what probes / sessions say about the backend sshd (the origin)
+    origin: OriginStatus,
 }
 
 struct SessionRow {
@@ -388,6 +403,7 @@ impl App {
             events,
             shutdown,
             sessions: Vec::new(),
+            origin: OriginStatus::Checking,
         });
         self.status = Status::Disconnected; // until the Listening event lands
         tracing::info!("starting forwarder for {}", self.settings.target);
@@ -486,20 +502,42 @@ impl App {
         let green = egui::Color32::from_rgb(0x3C, 0xB0, 0x57);
         let amber = egui::Color32::from_rgb(0xE8, 0xB0, 0x30);
         let gray = egui::Color32::from_rgb(0x90, 0x90, 0x90);
+        let red = egui::Color32::from_rgb(0xD9, 0x4A, 0x3C);
         match (&self.status, self.engine.as_ref()) {
-            (Status::Listening { addr }, Some(e)) => (
-                green,
-                if !e.sessions.is_empty() {
+            (Status::Listening { addr }, Some(e)) => {
+                let sessions = if !e.sessions.is_empty() {
                     format!(
-                        "Connected · {} · {} active session{}",
+                        "{} · {} active session{}",
                         addr,
                         e.sessions.len(),
                         if e.sessions.len() == 1 { "" } else { "s" }
                     )
                 } else {
-                    format!("Connected · {addr} (waiting for the first connection)")
-                },
-            ),
+                    format!("{addr} (waiting for the first connection)")
+                };
+                match &e.origin {
+                    // Probes (and live traffic) verified the backend SSH.
+                    OriginStatus::Verified => {
+                        (green, format!("Connected · {sessions} · origin ok"))
+                    }
+                    // Listener + tunnel are up; the last hop is being checked.
+                    OriginStatus::Checking => (
+                        amber,
+                        format!(
+                            "Connected · {sessions} · checking whether the backend sshd answers…"
+                        ),
+                    ),
+                    // The production failure class: TLS/WS green, backend
+                    // dead. Never dress this up as a plain green Connected.
+                    OriginStatus::Unreachable(detail) => (
+                        red,
+                        format!(
+                            "Listener up · the backend origin is NOT answering \
+                             — {detail}"
+                        ),
+                    ),
+                }
+            }
             (Status::Listening { .. }, None) => (green, "Connected".to_owned()),
             (Status::Stopping, _) => (amber, "Disconnecting…".to_owned()),
             (Status::Disconnected, Some(_)) => (amber, "Connecting…".to_owned()),
@@ -540,6 +578,21 @@ impl App {
                             stats,
                         });
                     }
+                    ForwarderEvent::OriginHealth { healthy, detail } => {
+                        if healthy {
+                            tracing::info!("origin verified: {detail}");
+                        } else {
+                            tracing::warn!("origin unreachable: {detail}");
+                        }
+                        handle.origin = if healthy {
+                            OriginStatus::Verified
+                        } else {
+                            OriginStatus::Unreachable(detail)
+                        };
+                        if let Some(t) = self.tray.as_mut() {
+                            t.set_origin_reachable(healthy);
+                        }
+                    }
                     ForwarderEvent::SessionEnded { id, error: Some(e) } => {
                         // Session failures are the #1 invisible failure mode:
                         // the listener is green while every client connection
@@ -551,6 +604,27 @@ impl App {
                         );
                         tracing::warn!("session failed: {short}");
                         self.last_error = Some(format!("session failed: {short}"));
+                        // A session that got ZERO bytes from the origin is the
+                        // definitive dead-backend signature (a live sshd sends
+                        // its banner immediately). Mirror the engine's verdict
+                        // in the banner right away — probes only run every 60s.
+                        let origin_silent = handle
+                            .sessions
+                            .iter()
+                            .find(|r| r.id == id)
+                            .is_some_and(|r| {
+                                r.stats.down.load(std::sync::atomic::Ordering::Relaxed) == 0
+                            });
+                        if origin_silent {
+                            let detail = format!(
+                                "the tunnel failed before any data from the origin ({short})"
+                            );
+                            tracing::warn!("origin unreachable: {detail}");
+                            handle.origin = OriginStatus::Unreachable(detail);
+                            if let Some(t) = self.tray.as_mut() {
+                                t.set_origin_reachable(false);
+                            }
+                        }
                         tracing::info!("device disconnected: session #{id}");
                         handle.sessions.retain(|r| r.id != id);
                     }

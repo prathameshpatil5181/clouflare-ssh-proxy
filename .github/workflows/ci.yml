@@ -3,7 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    # v-prefixed tags are the convention (docs/RELEASING.md), but bare
+    # semver tags like 1.0.0 are also accepted — a tag that fails this
+    # filter triggers NOTHING, which is invisible until you go looking
+    # for files that never reached the release.
+    tags: ['v*', '[0-9]*.[0-9]*.[0-9]*']
   pull_request:
   workflow_dispatch:
 
@@ -60,6 +64,8 @@ jobs:
     # Produces a portable zip (cfssh-gui + cfssh-proxy CLI) — copy anywhere
     # user-writable and run; no installer, no admin rights required.
     runs-on: windows-latest
+    permissions:
+      contents: write # tag builds attach the zip to the release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -84,18 +90,39 @@ jobs:
           "Learn host key" safely pins the sshd fingerprint through the tunnel
           (and is needed again whenever the container/server is recreated).
           TXT
-          (cd dist && tar -ca -f "../cfssh-gui-portable.zip" *)
-          sha256sum cfssh-gui-portable.zip > cfssh-gui-portable.zip.sha256
+      # Zip + checksum with PowerShell's own archiver. Two portability
+      # traps eliminated: bash's GNU tar cannot write zip containers at
+      # all (it wrote a POSIX tar named *.zip — verified locally), and
+      # invoking the native bsdtar from bash died on the CI runner
+      # ("sha256sum: cfssh-gui-portable.zip: No such file or directory").
+      # Compress-Archive is in the box on every windows runner.
+      - name: Zip + checksum (PowerShell archiver)
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath cfssh-gui-portable.zip -Force
+          $hash = (Get-FileHash -Path cfssh-gui-portable.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  cfssh-gui-portable.zip" | Set-Content -Encoding ascii cfssh-gui-portable.zip.sha256
       - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
         with:
           name: gui-portable-windows
           path: |
             *.zip
             *.zip.sha256
+      # Tag builds: the portable zip is the primary way users consume the
+      # app (README's download instructions) — attach it to the release.
+      - name: Attach portable zip to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cfssh-gui-portable.zip
+            cfssh-gui-portable.zip.sha256
 
   release:
-    # On tags: build release binaries for all five targets.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # On tags: build release binaries for all five targets. Accepts both
+    # v1.0.0 and 1.0.0 (see the `on.push.tags` note at the top).
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [linux-full, macos-tests, windows-tests]
     runs-on: ${{ matrix.os }}
     permissions:

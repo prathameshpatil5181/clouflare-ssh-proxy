@@ -1,8 +1,12 @@
 //! Tunnel connection plumbing shared by the connect/listen CLI modes and the
 //! `trust` subcommand (one-shot bridge for ssh-keyscan).
 
+use std::time::Duration;
+
+use futures_util::StreamExt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 use crate::bridge;
 use crate::config;
@@ -87,6 +91,102 @@ fn map_connect_error(e: tokio_tungstenite::tungstenite::Error, client_id: Option
             }
         }
         other => Error::Connect(format!("{other}")),
+    }
+}
+
+// ------------------------------------------------------------ origin probe
+
+/// How long to wait for the origin's first bytes once the tunnel is up. sshd
+/// transmits its `SSH-2.0-…` banner immediately on connect, so a live origin
+/// answers far sooner.
+const PROBE_BANNER_WAIT: Duration = Duration::from_secs(5);
+/// Whole-probe watchdog (tunnel upgrade + banner wait). A probe must never
+/// hang: it is only an instrument, not the connection.
+const PROBE_TOTAL: Duration = Duration::from_secs(12);
+
+/// Probe the ORIGIN behind the tunnel (usually sshd), NOT the tunnel itself.
+///
+/// The failure this exists for: TLS and the WS upgrade both succeed against
+/// Cloudflare even when the backend service is dead ("tunnel green, origin
+/// dead" — the 2026-10-29 production incident). The proof of origin health
+/// is inbound bytes: sshd speaks first, so receiving anything at all after
+/// the upgrade proves the last hop is alive. A silent tunnel (upgrade OK,
+/// no data, then reset/close) is exactly the "sshd is down" signature.
+///
+/// Returns `(healthy, human detail for the banner/log)`.
+pub async fn probe_origin(url: &str, creds: Option<&config::Credentials>) -> (bool, String) {
+    match tokio::time::timeout(PROBE_TOTAL, probe_origin_inner(url, creds)).await {
+        Ok(res) => res,
+        Err(_) => (
+            false,
+            format!(
+                "the origin probe did not complete within {} s",
+                PROBE_TOTAL.as_secs()
+            ),
+        ),
+    }
+}
+
+async fn probe_origin_inner(url: &str, creds: Option<&config::Credentials>) -> (bool, String) {
+    let mut ws = match connect_ws(url, creds).await {
+        Ok(ws) => ws,
+        Err(e) => return (false, format!("tunnel upgrade failed: {e}")),
+    };
+    let deadline = tokio::time::Instant::now() + PROBE_BANNER_WAIT;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Binary(data)))) => {
+                return (
+                    true,
+                    format!("origin answered with {}", first_bytes_summary(&data)),
+                );
+            }
+            // Tunnel keepalives carry no origin evidence; keep waiting.
+            Ok(Some(Ok(WsMessage::Ping(_)))) | Ok(Some(Ok(WsMessage::Pong(_)))) => {}
+            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) => {
+                return (
+                    false,
+                    "the tunnel closed without any data from the origin (sshd is not answering)"
+                        .to_string(),
+                );
+            }
+            Ok(Some(Ok(_))) => {
+                // Any other frame type (text, raw frame) is still inbound
+                // traffic from the origin: first bytes received.
+                return (true, "the origin sent a frame".to_string());
+            }
+            Ok(Some(Err(e))) => {
+                return (
+                    false,
+                    format!("the connection reset before any data from the origin: {e}"),
+                );
+            }
+            Err(_) => {
+                return (
+                    false,
+                    format!(
+                        "no data from the origin within {} s (is sshd running on the backend?)",
+                        PROBE_BANNER_WAIT.as_secs()
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// The first printable run of bytes, for a human detail line like
+/// "SSH-2.0-OpenSSH_9.6p1 Ubuntu…". ASCII-only, so truncation is char-safe.
+fn first_bytes_summary(data: &[u8]) -> String {
+    let printable: String = data
+        .iter()
+        .take(96)
+        .take_while(|&&b| b.is_ascii_graphic() || b == b' ')
+        .map(|&b| b as char)
+        .collect();
+    if printable.is_empty() {
+        format!("{} bytes of binary data", data.len())
+    } else {
+        printable
     }
 }
 

@@ -21,6 +21,14 @@ no `cloudflared` and no WARP on the client machine.
   the UI (never hidden behind a green banner); the tunnel host is
   DNS-preflighted at Connect — a typo fails once, loudly, naming the
   field (three separate host typos motivated this).
+- **Honest connection state**: "Connected" means the backend SSH is
+  actually answering, not just that the tunnel is green. The engine
+  probes the origin (sshd's greeting banner) right after Connect and
+  every 60 s, and any session that dies before a single byte comes
+  back from the origin is reported the same way. A dead backend now
+  shows a red "Listener up · the backend origin is NOT answering"
+  banner (and an amber tray icon) instead of a misleading green
+  "Connected" — the production failure class of 2026-10-29.
 - **Usable logs**: UTC timestamps, no ANSI, third-party render spam
   clamped by default, live substring filter in the Logs tab,
   `CFSSH_LOUD=1` / `RUST_LOG=debug` for full detail.

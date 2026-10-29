@@ -34,6 +34,9 @@ pub enum EdgeMode {
     Fragment,
     /// Never send anything (used to observe keepalive Pings).
     Silent,
+    /// Send one fixed binary frame immediately (simulates sshd's greeting
+    /// banner: the origin speaks first), then hold the connection.
+    Banner(Vec<u8>),
 }
 
 #[derive(Clone)]
@@ -395,8 +398,20 @@ async fn run_session(
     match &mode {
         EdgeMode::TcpBridge(addr) => tcp_bridge_session(input, output, addr.clone()).await,
         EdgeMode::Silent => silent_session(input, output, pings).await,
+        EdgeMode::Banner(payload) => banner_session(input, output, payload.clone()).await,
         _ => data_session(input, output, mode, pings).await,
     }
+}
+
+/// Speak first (like an sshd greeting), then hold silence: banner probes,
+/// origin-health checks, "did the backend answer" style tests.
+async fn banner_session(
+    input: ReadHalf,
+    mut out: WriteHalf,
+    payload: Vec<u8>,
+) -> std::io::Result<()> {
+    write_frame(&mut out, OP_BIN, &payload, true).await?;
+    silent_session(input, out, Arc::new(AtomicUsize::new(0))).await
 }
 
 /// Echo / Fragment / CloseAfterN loop.
