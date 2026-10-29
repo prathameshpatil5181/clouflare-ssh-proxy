@@ -136,5 +136,8 @@ mod imp {
     fn _typecheck(_app: &mut App) {}
 }
 
+/// Windows: re-export the tray implementation only — `Action` already
+/// exists at top level; re-exporting the private `use` import errors
+/// ("`Action` is private, cannot be re-exported") and duplicate-defines it.
 #[cfg(windows)]
-pub use imp::{Action, Tray};
+pub use imp::Tray;
