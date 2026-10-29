@@ -1,6 +1,6 @@
 [package]
 name = "cfssh-proxy"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "OpenSSH ProxyCommand helper: bridges SSH over a Cloudflare Tunnel WebSocket (no local cloudflared needed)"
 license = "MIT"

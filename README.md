@@ -314,4 +314,12 @@ examples/       mock_edge_runner.rs (local "cloudflared" stand-in for e2e)
 scripts/        e2e.sh (layer 3) · live-test.sh (optional, real tunnel)
 container/      Dockerfile + docker-compose.yml for the dev container
 .github/        CI: layers 1-3 + release binaries
+docs/           RELEASING.md — how to publish a GitHub release (tag → binaries)
 ```
+
+## 9. Releases
+
+Binaries for Linux (x64/arm64), macOS (x64/arm64) and Windows (CLI +
+GUI exe) are attached automatically to every GitHub Release — push a
+tag `v1.1.0`-style tag, CI verifies the commit on all three platforms
+first, and only then publishes. See [docs/RELEASING.md](docs/RELEASING.md).
