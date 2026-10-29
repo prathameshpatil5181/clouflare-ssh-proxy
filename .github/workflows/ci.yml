@@ -43,7 +43,7 @@ jobs:
       - run: cargo test
 
   windows-tests:
-    # Layers 1-2 on Windows (stdio binary-safety).
+    # Layers 1-2 on Windows (stdio binary-safety) + GUI compile check.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +52,44 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --features gui --all-targets -- -D warnings
       - run: cargo test
+
+  windows-gui:
+    # The GUI app: builds on every push so the artifact is always current.
+    # Produces a portable zip (cfssh-gui + cfssh-proxy CLI) — copy anywhere
+    # user-writable and run; no installer, no admin rights required.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build GUI (release, no console window in release builds)
+        run: cargo build --release --features gui -p cfssh-proxy --bin cfssh-gui
+      - name: Package portable zip
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/cfssh-gui.exe   dist/cfssh-gui.exe
+          cp target/release/cfssh-proxy.exe dist/cfssh-proxy.exe
+          cat > dist/README.txt <<'TXT'
+          cfssh-proxy GUI (portable, Windows, no admin needed)
+
+          1. Put these files anywhere user-writable, e.g. %LOCALAPPDATA%\cfssh-proxy
+          2. Run cfssh-gui.exe
+          3. Type your tunnel host (e.g. ssh.example.com), click Connect
+          4. Point IntelliJ/ssh at the shown host:port (default 127.0.0.1:22022)
+
+          "Learn host key" safely pins the sshd fingerprint through the tunnel
+          (and is needed again whenever the container/server is recreated).
+          TXT
+          (cd dist && tar -ca -f "../cfssh-gui-portable.zip" *)
+          sha256sum cfssh-gui-portable.zip > cfssh-gui-portable.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-portable-windows
+          path: |
+            *.zip
+            *.zip.sha256
 
   release:
     # On tags: build release binaries for all five targets.
@@ -82,13 +119,22 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
         if: matrix.target == 'aarch64-unknown-linux-gnu'
       - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} --features gui -p cfssh-proxy --bin cfssh-gui
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+        if: matrix.target != 'x86_64-pc-windows-msvc'
       - name: Rename with platform
         shell: bash
         run: |
           mkdir -p dist
           out="cfssh-proxy-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/cfssh-proxy${{ matrix.ext }}" "dist/${out}${{ matrix.ext }}"
+          if [ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]; then
+            cp "target/${{ matrix.target }}/release/cfssh-gui.exe" "dist/cfssh-gui-${GITHUB_REF_NAME#v}.exe"
+          fi
           (cd dist && sha256sum "${out}${{ matrix.ext }}" > "${out}${{ matrix.ext }}.sha256")
       - uses: actions/upload-artifact@v4
         with:

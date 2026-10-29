@@ -1,24 +1,50 @@
 [package]
 name = "cfssh-proxy"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "OpenSSH ProxyCommand helper: bridges SSH over a Cloudflare Tunnel WebSocket (no local cloudflared needed)"
 license = "MIT"
 
+[lib]
+name = "cfssh_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cfssh-proxy"
+path = "src/main.rs"
+
+# GUI only ships on Windows today; `--features gui` gates the heavy deps so
+# CI/unit tests stay lean. The same eframe code is the future mac/linux UI.
+[[bin]]
+name = "cfssh-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["dep:eframe"]
+
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros"] }
+eframe = { version = "0.29", optional = true, default-features = false, features = ["default_fonts", "glow", "wgpu", "x11", "wayland"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "process"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 # ring is selected explicitly and installed in main() so TLS never fails with
 # "could not automatically determine the process-level CryptoProvider".
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
+# Pure-Rust SSH2 host-key probe (GUI trust flow; no external ssh-keyscan).
+# ring feature keeps crypto in ring — avoids aws-lc-rs/CMake on the Windows build.
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
+# known_hosts handling (untrust/trust): plain + `|1|hash|salt` entries (ring HMAC-SHA1)
+base64 = "0.22"
+ring = "0.17.14"
 
 [profile.release]
 opt-level = "z"
@@ -26,3 +52,8 @@ lto = true
 strip = true
 panic = "abort"
 codegen-units = 1
+
+# Tray icon — Windows-only first. The tray module in the GUI is cfg(windows);
+# other platforms keep the plain window until tray support is wanted there.
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"

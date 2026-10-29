@@ -77,6 +77,24 @@ Requirements for a JetBrains-friendly dev container:
 See `examples/Dockerfile` + `examples/docker-compose.yml` for a working
 starting point. Sanity check on the server: `ssh -p 2222 dev@localhost`.
 
+### When the container is recreated (SSH host key changed) — one-line recovery
+
+```bash
+# Re-learn the CURRENT key through the tunnel and pin it (prints fingerprints):
+cfssh-proxy trust ssh.ppcoder.xyz                                          # direct (client port 22)
+cfssh-proxy trust ssh.ppcoder.xyz --client-host 127.0.0.1 --client-port 22022
+                                                                           # via a --listen forwarder
+
+# Only clear stale pins, without re-learning:
+cfssh-proxy untrust ssh.ppcoder.xyz 127.0.0.1:22022
+```
+
+`trust` is Trust-On-First-Use with a fingerprint display: it runs the
+ephemeral local tunnel bridge itself, scans the key with `ssh-keyscan`,
+shows the `SHA256:…` fingerprint, and replaces the old pin. If the tunnel or
+origin sshd is down, it fails with a clear error instead of pinning nothing.
+Both subcommands are fully generic — any tunnel target, host, or port.
+
 ### Later: switch to key-only SSH login
 
 1. On the laptop: `ssh-keygen -t ed25519`.
@@ -98,11 +116,21 @@ starting point. Sanity check on the server: `ssh -p 2222 dev@localhost`.
 
 ## 3. Installing cfssh-proxy (laptop)
 
-Grab a release binary for your platform (Linux x86_64/aarch64, macOS
-x86_64/aarch64, Windows x86_64), or build it:
+Windows users: download **`cfssh-gui-portable.zip`** from the GitHub
+releases/actions artifacts — it contains the desktop app (`cfssh-gui.exe`)
+and the CLI (`cfssh-proxy.exe`). Unzip anywhere user-writable such as
+`%LOCALAPPDATA%\cfssh-proxy` (no admin rights, no installer, no UAC), run
+`cfssh-gui.exe`, type your tunnel host, click **Connect**, and point
+IntelliJ/ssh at the shown `host:port` (default `127.0.0.1:22022`).
+**Learn host key** (the ⟳ button) pins the sshd fingerprint through the
+tunnel; run it again whenever the container/server is recreated.
+
+CLI users on all platforms: grab a release binary for your platform
+(Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64), or build it:
 
 ```bash
 cargo build --release        # binary in target/release/cfssh-proxy
+cargo build --release --features gui   # + the GUI app (cfssh-gui)
 ```
 
 Put the binary on your `PATH` (e.g. `~/.local/bin/cfssh-proxy`).
@@ -192,6 +220,45 @@ Then in IntelliJ/Gateway use:
 No ProxyCommand, no "Use OpenSSH config" checkbox needed — the IDE sees an
 ordinary SSH host.
 
+### VS Code Remote-SSH
+
+VS Code drives the system OpenSSH client, so it honors the same local
+forwarder. Two ways to hook it up:
+
+**One click from the GUI** — click **"Write ssh config entry (VS Code)"**
+in the right panel. The app appends (or repairs) one delimited block to your
+SSH config, idempotently and without touching anything else:
+
+```
+# --- cfssh-proxy ( managed block; safe to edit or delete ) ---
+Host cfssh-dev
+    HostName 127.0.0.1
+    Port 22322
+    User dev
+# --- end cfssh-proxy ---
+```
+
+(`Port` follows the GUI's forwarder port; `User` is the **SSH user** field.)
+Then in VS Code: `F1` → **Remote-SSH: Connect to Host…** → `cfssh-dev`.
+Re-run the button whenever you change the port or user in the GUI; the block
+is updated in place.
+
+**Manual** — add the block above to `~/.ssh/config` (Windows: 
+`%USERPROFILE%\.ssh\config`) yourself, or add a `Host cfssh-dev` entry with
+`HostName 127.0.0.1` / `Port <forwarder port>`.
+
+Notes:
+
+- The tunnel's host key is pinned per-client-endpoint: after **Learn host
+  key** or `trust`, `[127.0.0.1]:<port>` is in `known_hosts`, so VS Code's
+  ssh connects without prompting — and refuses promptly if the key changes
+  (container recreated), same as plain ssh.
+- VS Code's remote host binary lands in the container (`~/.vscode-server`),
+  and the container needs `bash` + download tooling — already true for the
+  repo's Docker image.
+- If you keep your SSH config elsewhere (`remote.SSH.configFile`), copy the
+  block there; the GUI's button always writes the default location.
+
 ---
 
 ## 5. Self-tests
@@ -247,4 +314,12 @@ examples/       mock_edge_runner.rs (local "cloudflared" stand-in for e2e)
 scripts/        e2e.sh (layer 3) · live-test.sh (optional, real tunnel)
 container/      Dockerfile + docker-compose.yml for the dev container
 .github/        CI: layers 1-3 + release binaries
+docs/           RELEASING.md — how to publish a GitHub release (tag → binaries)
 ```
+
+## 9. Releases
+
+Binaries for Linux (x64/arm64), macOS (x64/arm64) and Windows (CLI +
+GUI exe) are attached automatically to every GitHub Release — push a
+tag `v1.1.0`-style tag, CI verifies the commit on all three platforms
+first, and only then publishes. See [docs/RELEASING.md](docs/RELEASING.md).
