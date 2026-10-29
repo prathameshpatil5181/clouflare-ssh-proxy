@@ -7,11 +7,18 @@
 //! GUI passes a shutdown receiver it can trigger.
 
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::config::{self, CliCredentials, EnvSource};
 use crate::error::Error;
 use crate::tunnel;
+
+/// Origin-health probes run once right after the listener is up and then
+/// every PROBE_INTERVAL. One probe is one extra WebSocket through the
+/// tunnel; sshd answers instantly, so this is cheap and quiet.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Everything needed to bring up a forwarder. `target` is the tunnel target
 /// exactly as presented by the user (bare host or URL; normalized here).
@@ -50,9 +57,9 @@ impl ForwarderConfig {
 #[derive(Debug)]
 pub struct SessionStats {
     /// Bytes tunneled client → server (what the client sent).
-    pub up: std::sync::atomic::AtomicU64,
+    pub up: AtomicU64,
     /// Bytes tunneled server → client (what the client received).
-    pub down: std::sync::atomic::AtomicU64,
+    pub down: AtomicU64,
     /// Roughly "is it alive": monotonic traffic markers, touched on every
     /// message so a UI can show a heartbeat instead of raw bytes.
     pub activity: std::sync::atomic::AtomicBool,
@@ -61,8 +68,8 @@ pub struct SessionStats {
 impl SessionStats {
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            up: std::sync::atomic::AtomicU64::new(0),
-            down: std::sync::atomic::AtomicU64::new(0),
+            up: AtomicU64::new(0),
+            down: AtomicU64::new(0),
             activity: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -93,6 +100,12 @@ pub enum ForwarderEvent {
     },
     /// One bridged session ended (client or tunnel side closed).
     SessionEnded { id: u64, error: Option<String> },
+    /// The most recent origin-health check result. `healthy == true` means
+    /// the backend (sshd) PROVED it answers — inbound bytes arrived through
+    /// the tunnel; `false` means the tunnel was up but the origin was silent.
+    /// The UI must never present a plain green "Connected" while the origin
+    /// is dead (production incident, 2026-10-29).
+    OriginHealth { healthy: bool, detail: String },
     /// The forwarder itself stopped (shutdown triggered, or error).
     Stopped { error: Option<String> },
 }
@@ -138,6 +151,38 @@ pub async fn run_forwarder(
         .map_err(|e| Error::WsSetup(format!("listener has no address: {e}")))?;
     let _ = events.send(ForwarderEvent::Listening { addr });
 
+    // Origin-health watchdog. The listener being up says nothing about the
+    // backend behind the tunnel — TLS/WS can be perfectly green while sshd
+    // is dead. probe_origin (tunnel.rs) asks the question once at startup
+    // and then on a slow cadence, and publishes OriginHealth events so the
+    // UI can show the REAL state.
+    let probe_target = cfg.target.clone();
+    let probe_creds = cfg.credentials.clone();
+    let probe_events = events.clone();
+    let mut probe_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(PROBE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = probe_shutdown.changed() => return,
+                _ = ticker.tick() => {}
+            }
+            let (healthy, detail) = tunnel::probe_origin(&probe_target, probe_creds.as_ref()).await;
+            if healthy {
+                tracing::info!(origin_healthy = true, detail = %detail, "origin probe ok");
+            } else {
+                tracing::warn!(origin_healthy = false, detail = %detail, "origin probe failed");
+            }
+            if probe_events
+                .send(ForwarderEvent::OriginHealth { healthy, detail })
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
     let mut next_id: u64 = 0;
     loop {
         let sock = tokio::select! {
@@ -165,10 +210,29 @@ pub async fn run_forwarder(
         let keepalive = cfg.keepalive;
         let ev = events.clone();
         tokio::spawn(async move {
-            let result = tunnel::serve_conn(sock, &url, creds, keepalive, Some(stats)).await;
+            let result =
+                tunnel::serve_conn(sock, &url, creds, keepalive, Some(stats.clone())).await;
             let error = result.as_ref().err().map(|e| e.to_string());
             if let Some(err_text) = &error {
                 tracing::debug!(error = %err_text, "session ended with error");
+            }
+            // A session that failed WITHOUT a single inbound byte is direct
+            // evidence of a dead origin: a healthy sshd sends its banner
+            // immediately, and everything before it (TLS, WS upgrade) can be
+            // green while it happens. This is the customer-visible signature
+            // of the "tunnel green, backend dead" failure class.
+            if error.is_some() && stats.down.load(Ordering::Relaxed) == 0 {
+                let short = error.as_deref().unwrap_or("error").replace(
+                    "connection error: WebSocket error: WebSocket protocol error: ",
+                    "",
+                );
+                let detail =
+                    format!("a client session failed before any data from the origin ({short})");
+                tracing::warn!(origin_healthy = false, detail = %detail, "origin not reachable");
+                let _ = ev.send(ForwarderEvent::OriginHealth {
+                    healthy: false,
+                    detail,
+                });
             }
             let _ = ev.send(ForwarderEvent::SessionEnded { id, error });
         });
