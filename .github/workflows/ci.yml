@@ -63,8 +63,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build GUI (release, no console window in release builds)
-        run: cargo build --release --features gui -p cfssh-proxy --bin cfssh-gui
+      - name: Build GUI + CLI (release, no console window in release GUI)
+        run: cargo build --release --features gui -p cfssh-proxy
+        # Builds BOTH bins so the zip carries cfssh-proxy.exe (the CLI the
+        # README's instructions reference) alongside cfssh-gui.exe.
       - name: Package portable zip
         shell: bash
         run: |
