@@ -90,12 +90,18 @@ jobs:
           "Learn host key" safely pins the sshd fingerprint through the tunnel
           (and is needed again whenever the container/server is recreated).
           TXT
-          # The tar in git-bash is GNU tar, which does NOT write zip
-          # containers: `-a -f x.zip` produces a POSIX tar archive with a
-          # .zip name (verified locally). Windows' native bsdtar at
-          # C:\Windows\System32\tar.exe infers zip from the suffix properly.
-          /c/Windows/System32/tar.exe -caf ../cfssh-gui-portable.zip -C dist .
-          sha256sum cfssh-gui-portable.zip > cfssh-gui-portable.zip.sha256
+      # Zip + checksum with PowerShell's own archiver. Two portability
+      # traps eliminated: bash's GNU tar cannot write zip containers at
+      # all (it wrote a POSIX tar named *.zip — verified locally), and
+      # invoking the native bsdtar from bash died on the CI runner
+      # ("sha256sum: cfssh-gui-portable.zip: No such file or directory").
+      # Compress-Archive is in the box on every windows runner.
+      - name: Zip + checksum (PowerShell archiver)
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath cfssh-gui-portable.zip -Force
+          $hash = (Get-FileHash -Path cfssh-gui-portable.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  cfssh-gui-portable.zip" | Set-Content -Encoding ascii cfssh-gui-portable.zip.sha256
       - uses: actions/upload-artifact@v4
         if: "!startsWith(github.ref, 'refs/tags/')"
         with:
