@@ -541,12 +541,14 @@ async fn tcp_bridge_session(
                             .await;
                     }
                     OP_CLOSE => {
-                        let _ = send_tx
-                            .send(Send {
-                                opcode: OP_CLOSE,
-                                payload: f.payload,
-                            })
-                            .await;
+                        // Half-close semantics: the client closing its side
+                        // must NOT race a close frame back through the relay
+                        // channel — that can beat the origin's reply to the
+                        // wire and the child would exit with zero bytes out
+                        // (observed deterministically on macOS/Windows CI).
+                        // Just finished: shut down the origin write half; the
+                        // WS close frame to the client comes from task B
+                        // after the origin's EOF, i.e. after its final data.
                         break;
                     }
                     _ => {}

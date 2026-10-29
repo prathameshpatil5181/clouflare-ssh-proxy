@@ -64,7 +64,7 @@ mod imp {
             let connect_item = MenuItem::with_id(ID_CONNECT, "Connect", true, None);
             let disconnect_item = MenuItem::with_id(ID_DISCONNECT, "Disconnect", false, None);
             let quit = MenuItem::with_id(ID_QUIT, "Quit (stops the forwarder)", true, None);
-            let mut menu = Menu::new();
+            let menu = Menu::new();
             let _ = menu.append(&connect_item);
             let _ = menu.append(&disconnect_item);
             let _ = menu.append(&quit);
@@ -91,14 +91,14 @@ mod imp {
             self.connected = connected;
             self.connect_item.set_enabled(!connected);
             self.disconnect_item.set_enabled(connected);
-            self.tray.set_icon(
-                (if connected {
-                    &self.green_icon
-                } else {
-                    &self.gray_icon
-                })
-                .clone(),
-            );
+            let icon = (if connected {
+                &self.green_icon
+            } else {
+                &self.gray_icon
+            })
+            .clone();
+            // tray-icon 0.26 takes an Option (None = remove the icon).
+            let _ = self.tray.set_icon(Some(icon));
         }
 
         /// Drain tray menu events; translate to App actions.
@@ -136,5 +136,8 @@ mod imp {
     fn _typecheck(_app: &mut App) {}
 }
 
+/// Windows: re-export the tray implementation only — `Action` already
+/// exists at top level; re-exporting the private `use` import errors
+/// ("`Action` is private, cannot be re-exported") and duplicate-defines it.
 #[cfg(windows)]
-pub use imp::{Action, Tray};
+pub use imp::Tray;
