@@ -717,7 +717,25 @@ async fn tcp_bridge_relay_once() -> Result<(), String> {
     });
 
     let edge = support::mock_edge::start(EdgeMode::TcpBridge(origin_addr), edge_options()).await;
-    let (mut child, stdin, mut stdout, _stderr) = spawn(&edge, &["--insecure-ws"]).await;
+
+    // The only test whose child should not be silent when it dies: capture
+    // stderr so a failure message carries the child's own error (401 text,
+    // rustls panic, connect failure — whatever it is). stdout is still our
+    // relay sink; stderr is read AFTER the child ends (no deadlock).
+    let mut cmd = base_command(
+        &["--insecure-ws"],
+        &format!("127.0.0.1:{}", edge.addr.port()),
+    );
+    with_correct_env(&mut cmd);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cfssh-proxy");
+    let stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut child_err = child.stderr.take().expect("child stderr pipe");
 
     let _j = feed_and_close(stdin, b"ping".to_vec());
     let mut outcome = Ok(());
@@ -732,13 +750,29 @@ async fn tcp_bridge_relay_once() -> Result<(), String> {
             }
         }
         Err(e) => {
-            outcome = Err(format!("no relayed bytes reached stdout: {e}"));
+            // End the child so stderr closes, then surface its words.
             let _ = child.kill();
+            let _ = child.wait();
+            let mut captured = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut child_err, &mut captured);
+            let msg = match String::from_utf8(captured) {
+                Ok(s) if s.trim().is_empty() => "child stderr was empty".to_string(),
+                Ok(s) => format!("child stderr: {}", s.trim()),
+                Err(_) => "child stderr not utf8".to_string(),
+            };
+            outcome = Err(format!("no relayed bytes reached stdout ({e}); {msg}"));
         }
     }
     let _ = child.wait();
-    server.await.unwrap()?;
-    outcome
+    // Origin outcome, bounded so a never-accepting origin can't hang us.
+    let server_out = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
+    let origin_note = match server_out {
+        Ok(Ok(Ok(()))) => "origin completed normally".to_string(),
+        Ok(Ok(Err(e))) => format!("origin task failed: {e}"),
+        Ok(Err(join)) => format!("origin task did not run to completion: {join}"),
+        Err(_) => "origin was never reached in 3 s (edge never connected to it)".to_string(),
+    };
+    outcome.map_err(|e| format!("{e}; [origin] {origin_note}"))
 }
 
 /// On cold first-CI runners (macOS in particular: fresh process spawns are
